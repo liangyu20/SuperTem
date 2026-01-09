@@ -846,6 +846,10 @@ def maybe_from_dict(
         note_or_raise(extra, key or f"{getattr(cls, '__name__', 'object')}", e, mode=mode, raw=raw)
         return None
 
+# =============================================================================
+# Helpers
+# =============================================================================
+
 
 def _jsonable(obj: Any) -> Any:
     """Recursively convert object to JSON-safe primitives (dicts/lists/floats)."""
@@ -891,6 +895,83 @@ def _setup_init(obj: Any, mode_input: Any, owner_name: str) -> Tuple[ParseMode, 
     extra = normalize_extra(obj.extra) if strict else normalize_extra_lenient(obj.extra, owner_name)
     return mode, strict, extra
 
+def _setup_validate(obj_mode: Any, override_mode: Any) -> Tuple[ParseMode, bool]:
+    """
+    Standardizes the start of validation methods.
+    Returns: (effective_mode, is_strict_flag)
+    """
+    mode = as_parse_mode(obj_mode if override_mode is None else override_mode)
+    return mode, is_strict(mode)
+
+def _finish_to_dict(payload: Dict[str, Any], extra: Any) -> Dict[str, Any]:
+    """Standardizes the final steps of serialization: extras injection and cleanup."""
+    add_extra_if_any(payload, extra)
+    return _jsonable(drop_none_keys(payload))
+
+
+def _normalize_keyed_map(
+        target_cls: Type[T],
+        raw_map: Optional[Dict[str, Any]],
+        id_field: str,
+        owner_name: str,
+        mode: ParseMode,
+        extra: Extras
+) -> Dict[str, T]:
+    """Generic normalizer for dicts of objects (e.g. apertures, detectors)."""
+    out: Dict[str, T] = {}
+    if not raw_map:
+        return out
+
+    strict = is_strict(mode)
+
+    for k, v in raw_map.items():
+        # 1. Validate the key
+        key_norm = parse_optional_id_like(k, name=f"{owner_name}.key", strict=strict, extra=extra)
+        if key_norm is None:
+            if extra:
+                extra.notes[f"{owner_name}.{k}_raw_key"] = "Invalid ID Key"
+            continue
+
+        # 2. Parse the object
+        obj_key = f"{owner_name}.{key_norm}"
+        obj = maybe_from_dict(target_cls, v, mode=mode, extra=extra, key=obj_key)
+        if obj is None:
+            # Instantiate default if parsing failed or v was None
+            note_or_raise(
+                extra,
+                obj_key,
+                TypeError(f"Invalid or missing object for key '{key_norm}'"),
+                mode=mode,
+                raw=v,
+            )
+            try:
+                obj = target_cls(_mode=mode)  # type: ignore[arg-type]
+            except TypeError:
+                obj = target_cls()  # type: ignore[call-arg]
+                if hasattr(obj, "_mode"):
+                    try:
+                        setattr(obj, "_mode", mode)
+                    except Exception:
+                        pass
+
+        # 3. Reconcile Map Key vs Internal ID
+        internal_id = getattr(obj, id_field, None)
+
+        if internal_id is None:
+            setattr(obj, id_field, key_norm)
+        elif internal_id != key_norm:
+            note_or_raise(
+                extra,
+                f"{owner_name}.{key_norm}.id_mismatch",
+                ValueError(f"Key '{key_norm}' != internal id '{internal_id}'"),
+                mode=mode
+            )
+            # Trust the map key in lenient mode
+            setattr(obj, id_field, key_norm)
+
+        out[key_norm] = obj
+
+    return out
 
 # =============================================================================
 # Structures (Dataclasses)
@@ -934,14 +1015,20 @@ class Point:
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         # VALIDATION: Semantic check (Finiteness).
-        mode = as_parse_mode(self._mode if mode is None else mode)
+        mode, strict = _setup_validate(self._mode, mode)
         if not (math.isfinite(self.x) and math.isfinite(self.y) and math.isfinite(self.z)):
             note_or_raise(
                 None, "Point.coordinates",
                 ValueError(f"Coordinates must be finite: x={self.x}, y={self.y}, z={self.z}"),
                 mode=mode, raw={"x": self.x, "y": self.y, "z": self.z}
             )
-            return False
+            if strict:
+                return False
+            # Heal: Reset unstable coordinates to origin
+            self.x = 0.0 if not math.isfinite(self.x) else self.x
+            self.y = 0.0 if not math.isfinite(self.y) else self.y
+            self.z = 0.0 if not math.isfinite(self.z) else self.z
+
         return True
 
     def to_dict(self) -> dict:
@@ -963,7 +1050,6 @@ class Point:
 
     def to_list(self) -> list:
         return [self.x, self.y, self.z]
-
 
 @dataclass
 class ROI:
@@ -1004,39 +1090,40 @@ class ROI:
         self.height = _norm(self.height, "ROI.height", 512)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        # VALIDATION: Semantic bounds check and Healing.
-        mode = as_parse_mode(self._mode if mode is None else mode)
-        strict = is_strict(mode)
-        was_valid = True
+        mode, strict = _setup_validate(self._mode, mode)
+        is_valid = True
 
         # Rule 1: Origin must be non-negative
         if self.x < 0 or self.y < 0:
-            was_valid = False
             note_or_raise(
                 self.extra, "ROI.xy", ValueError(f"ROI.x/ROI.y must be >= 0, got x={self.x}, y={self.y}"),
                 mode=mode, raw={"x": self.x, "y": self.y},
             )
-            if not strict:
+            if strict:
+                is_valid = False
+            else:
+                # Heal: Clamp to 0 to prevent driver crashes
                 self.x = max(self.x, 0)
                 self.y = max(self.y, 0)
 
         # Rule 2: Dimensions must be positive
         if (self.width <= 0) or (self.height <= 0):
-            was_valid = False
             note_or_raise(
                 self.extra, "ROI.size", ValueError(f"ROI.width/ROI.height must be > 0, got width={self.width}, height={self.height}"),
                 mode=mode, raw={"width": self.width, "height": self.height},
             )
-            if not strict:
-                # Heal to safe defaults
+            if strict:
+                is_valid = False
+            else:
+                # Heal: Reset to default 512 to ensure a valid image request exists
                 self.width = 512 if self.width <= 0 else self.width
                 self.height = 512 if self.height <= 0 else self.height
-        return was_valid
+
+        return is_valid
 
     def to_dict(self) -> dict:
         d: Dict[str, Any] = {"x": self.x, "y": self.y, "width": self.width, "height": self.height}
-        add_extra_if_any(d, self.extra)
-        return _jsonable(drop_none_keys(d))
+        return _finish_to_dict(d, self.extra)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "ROI":
@@ -1116,7 +1203,7 @@ class StagePosition:
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         # VALIDATION: Check finiteness. Trust types from post_init.
-        mode = as_parse_mode(self._mode if mode is None else mode)
+        mode, strict = _setup_validate(self._mode, mode)
         is_valid = True
 
         def check_axis(q: Any, field_name: str) -> bool:
@@ -1148,8 +1235,7 @@ class StagePosition:
             "tilt_y_deg": serialize_quantity(self.tilt_y, "degree"),
             "coordinate_system": self.coordinate_system,
         }
-        add_extra_if_any(d, self.extra)
-        return _jsonable(drop_none_keys(d))
+        return _finish_to_dict(d, self.extra)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> 'StagePosition':
@@ -1203,9 +1289,8 @@ class StagePosition:
         def sub_axis(a, b, unit: str):
             qa = ensure_quantity(a, unit)
             qb = ensure_quantity(b, unit)
-            if qa is None and qb is None: return None
-            if qa is None: return -qb if qb is not None else None
-            if qb is None: return qa
+            # CRITICAL FIX: Do not treat None as Zero.
+            if qa is None or qb is None: return None
             return qa - qb
         return StagePosition(
             name=self.name,
@@ -1226,7 +1311,14 @@ class StagePosition:
             qb = ensure_quantity(b, unit)
             if qa is None or qb is None: return False
             da = abs(qa - qb)
-            return float(da.m_as(unit)) <= float(tol)
+            try:
+                dv = float(da.to(unit).magnitude)
+            except Exception:
+                try:
+                    dv = float(da.m_as(unit))  # type: ignore[attr-defined]
+                except Exception:
+                    return False
+            return dv <= float(tol)
         return (close_axis(self.x, other.x, "nanometer", tol_nm) and
                 close_axis(self.y, other.y, "nanometer", tol_nm) and
                 close_axis(self.z, other.z, "nanometer", tol_nm) and
@@ -1286,18 +1378,29 @@ class StageSystemSettings:
         self.can_tilt_x = parse_bool_like(self.can_tilt_x, default=False)
         self.can_tilt_y = parse_bool_like(self.can_tilt_y, default=False)
 
-        def _lim(val, unit):
-            if val is None: return None
+        def _lim(val, unit, name):
+            if val is None:
+                return None
             if isinstance(val, (list, tuple)) and len(val) == 2:
-                return (ensure_quantity(val[0], unit), ensure_quantity(val[1], unit))
+                a = ensure_quantity(val[0], unit)
+                b = ensure_quantity(val[1], unit)
+                if a is None or b is None:
+                    note_or_raise(self.extra, f"{name}_limits",
+                                  TypeError(f"{name} limits must be quantities in {unit}: got {val!r}"),
+                                  mode=mode, raw=val)
+                    return None
+                return (a, b)
+            note_or_raise(self.extra, f"{name}_limits",
+                          TypeError(f"{name} limits must be a (min,max) pair: got {val!r}"),
+                          mode=mode, raw=val)
             return None
 
-        self.x_limits = _lim(self.x_limits, "nm")
-        self.y_limits = _lim(self.y_limits, "nm")
-        self.z_limits = _lim(self.z_limits, "nm")
-        self.r_limits = _lim(self.r_limits, "degree")
-        self.tilt_x_limits = _lim(self.tilt_x_limits, "degree")
-        self.tilt_y_limits = _lim(self.tilt_y_limits, "degree")
+        self.x_limits = _lim(self.x_limits, "nm", "StageSystemSettings.x")
+        self.y_limits = _lim(self.y_limits, "nm", "StageSystemSettings.y")
+        self.z_limits = _lim(self.z_limits, "nm", "StageSystemSettings.z")
+        self.r_limits = _lim(self.r_limits, "degree", "StageSystemSettings.r")
+        self.tilt_x_limits = _lim(self.tilt_x_limits, "degree", "StageSystemSettings.tilt_x")
+        self.tilt_y_limits = _lim(self.tilt_y_limits, "degree", "StageSystemSettings.tilt_y")
 
         self.max_step_distance = ensure_quantity(self.max_step_distance, "nm") or Q_(50000.0, "nm")
         self.max_step_angle = ensure_quantity(self.max_step_angle, "degree") or Q_(1.0, "degree")
@@ -1313,8 +1416,7 @@ class StageSystemSettings:
         VALIDATION: Integrity of Meaning (Self-Consistency).
         Checks if the configuration itself is logical and complete.
         """
-        mode = as_parse_mode(self._mode if mode is None else mode)
-        strict = is_strict(mode)
+        mode, strict = _setup_validate(self._mode, mode)
         ok = True
 
         # 1. Logical Range Checks (Min <= Max)
@@ -1324,13 +1426,13 @@ class StageSystemSettings:
                 if mn > mx:
                     note_or_raise(self.extra, f"StageSystemSettings.{name}_limits",
                                   ValueError(f"{name} limits invalid: min > max ({mn} > {mx})"), mode=mode)
-                    if not strict:
-                        # Heal swapped limits
-                        try:
-                            setattr(self, f"{name}_limits", (mx, mn))
-                        except Exception:
-                            pass
-                    return False
+                    if strict:
+                        return False
+                    # Heal: Swap limits to make range valid
+                    try:
+                        setattr(self, f"{name}_limits", (mx, mn))
+                    except Exception:
+                        pass
             return True
 
         ok = _check_range(self.x_limits, "x") and ok
@@ -1340,13 +1442,17 @@ class StageSystemSettings:
         ok = _check_range(self.tilt_x_limits, "tilt_x") and ok
         ok = _check_range(self.tilt_y_limits, "tilt_y") and ok
 
-        # 2. Cross-Field Consistency (Rule 2B)
-        # If an axis is enabled, it SHOULD have limits defined to be safe.
+        # 2. Cross-Field Consistency
         def _check_completeness(enabled: bool, limits: Any, name: str):
             if enabled and limits is None:
                 note_or_raise(self.extra, f"StageSystemSettings.{name}_safety",
                               ValueError(f"Axis {name} is enabled but has no safety limits defined."), mode=mode)
-                return False
+                if not strict:
+                     # Heal: Disable the unsafe axis
+                     try: setattr(self, f"can_{name}", False)
+                     except: pass
+                else:
+                     return False
             return True
 
         ok = _check_completeness(self.can_x, self.x_limits, "x") and ok
@@ -1360,19 +1466,31 @@ class StageSystemSettings:
         if self.max_step_distance.magnitude <= 0:
             note_or_raise(self.extra, "StageSystemSettings.max_step_distance",
                           ValueError("max_step_distance must be > 0"), mode=mode)
-            ok = False
+            if strict:
+                ok = False
+            else:
+                # Heal: Reset to default safe step (50um)
+                self.max_step_distance = Q_(50000.0, "nm")
 
         if self.eucentric_z is not None and self.z_limits:
             z_min, z_max = self.z_limits
             if not (z_min <= self.eucentric_z <= z_max):
                 note_or_raise(self.extra, "StageSystemSettings.eucentric_z",
                               ValueError(f"eucentric_z ({self.eucentric_z}) outside z_limits"), mode=mode)
-                ok = False
+                if strict:
+                    ok = False
+                else:
+                    # Heal: Mark as unknown/unsafe to use
+                    self.eucentric_z = None
 
         if self.settle_time_s < 0:
             note_or_raise(self.extra, "StageSystemSettings.settle_time_s", ValueError("Settle time must be >= 0"),
                           mode=mode)
-            ok = False
+            if strict:
+                ok = False
+            else:
+                # Heal: Reset to safe default
+                self.settle_time_s = 0.2
 
         return ok
 
@@ -1456,8 +1574,7 @@ class StageSystemSettings:
             "settle_time_s": self.settle_time_s,
             "timeout_s": self.timeout_s
         }
-        add_extra_if_any(d, self.extra)
-        return _jsonable(drop_none_keys(d))
+        return _finish_to_dict(d, self.extra)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "StageSystemSettings":
@@ -1493,22 +1610,6 @@ class StageSystemSettings:
 
 @dataclass
 class BeamSettings:
-    """
-    Parameters controlling the electron beam and electromagnetic lenses.
-
-    Encapsulates optical settings including accelerating voltage, current, and lens deflections.
-
-    Attributes:
-        voltage: Accelerating voltage (High Tension).
-        beam_current: Probe current measured at the specimen or screen.
-        spot_size: Discrete index representing the condenser lens combination.
-        convergence_angle: Semi-convergence angle of the probe in STEM mode.
-        defocus: Deviation from the focal plane (positive usually implies overfocus).
-        stigmation: 2D vector controlling stigmator coils.
-        beam_shift: 2D vector controlling beam tilt/shift coils.
-        image_shift: 2D vector controlling image shift coils.
-        scan_rotation: Rotation of the scanning raster.
-    """
     voltage: Optional["Quantity"] = None
     beam_current: Optional["Quantity"] = None
     spot_size: Optional[int] = None
@@ -1538,29 +1639,43 @@ class BeamSettings:
         self.spot_size = parse_optional_int_like(self.spot_size, name="BeamSettings.spot_size", strict=strict,
                                                  extra=self.extra)
 
-        self.stigmation = maybe_from_dict(Point, self.stigmation, extra=self.extra, key="BeamSettings.stigmation", mode=mode)
-        self.beam_shift = maybe_from_dict(Point, self.beam_shift, extra=self.extra, key="BeamSettings.beam_shift", mode=mode)
-        self.image_shift = maybe_from_dict(Point, self.image_shift, extra=self.extra, key="BeamSettings.image_shift", mode=mode)
+        self.stigmation = maybe_from_dict(Point, self.stigmation, extra=self.extra, key="BeamSettings.stigmation",
+                                          mode=mode)
+        self.beam_shift = maybe_from_dict(Point, self.beam_shift, extra=self.extra, key="BeamSettings.beam_shift",
+                                          mode=mode)
+        self.image_shift = maybe_from_dict(Point, self.image_shift, extra=self.extra, key="BeamSettings.image_shift",
+                                           mode=mode)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        mode = as_parse_mode(self._mode if mode is None else mode)
+        mode, strict = _setup_validate(self._mode, mode)
         ok = True
+
         if self.stigmation: ok = self.stigmation.validate(mode=mode) and ok
         if self.beam_shift: ok = self.beam_shift.validate(mode=mode) and ok
         if self.image_shift: ok = self.image_shift.validate(mode=mode) and ok
-        if self.convergence_angle is not None and self.convergence_angle.magnitude < 0:
-            note_or_raise(self.extra, "BeamSettings.convergence_angle",
-                          ValueError("Convergence angle must be >= 0"), mode=mode)
-            ok = False
-        if self.voltage is not None and self.voltage.magnitude <= 0:
-            note_or_raise(self.extra, "BeamSettings.voltage", ValueError("Voltage must be > 0"), mode=mode)
-            ok = False
-        if self.beam_current is not None and self.beam_current.magnitude < 0:
-            note_or_raise(self.extra, "BeamSettings.beam_current", ValueError("Beam current must be >= 0"), mode=mode)
-            ok = False
-        if self.spot_size is not None and self.spot_size < 0:
-            note_or_raise(self.extra, "BeamSettings.spot_size", ValueError("Spot size must be >= 0"), mode=mode)
-            ok = False
+
+        # Helper to check positivity and heal
+        def _check_pos_qty(val, name, attr_name):
+            if val is not None and val.magnitude < 0:
+                note_or_raise(self.extra, name, ValueError(f"{name} must be >= 0"), mode=mode)
+                if strict:
+                    return False
+                setattr(self, attr_name, None)  # Heal: Set to Unknown
+            return True
+
+        def _check_pos_int(val, name, attr_name):
+            if val is not None and val < 0:
+                note_or_raise(self.extra, name, ValueError(f"{name} must be >= 0"), mode=mode)
+                if strict:
+                    return False
+                setattr(self, attr_name, None)  # Heal: Set to Unknown
+            return True
+
+        ok = _check_pos_qty(self.convergence_angle, "BeamSettings.convergence_angle", "convergence_angle") and ok
+        ok = _check_pos_qty(self.voltage, "BeamSettings.voltage", "voltage") and ok
+        ok = _check_pos_qty(self.beam_current, "BeamSettings.beam_current", "beam_current") and ok
+        ok = _check_pos_int(self.spot_size, "BeamSettings.spot_size", "spot_size") and ok
+
         return ok
 
     def to_dict(self) -> dict:
@@ -1575,8 +1690,7 @@ class BeamSettings:
             "beam_shift": self.beam_shift.to_dict() if self.beam_shift else None,
             "image_shift": self.image_shift.to_dict() if self.image_shift else None,
         }
-        add_extra_if_any(d, self.extra)
-        return _jsonable(drop_none_keys(d))
+        return _finish_to_dict(d, self.extra)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "BeamSettings":
@@ -1611,6 +1725,9 @@ class BeamSettings:
             extra=extra, _mode=mode
         )
 
+# Alias for semantic clarity in Read-Only contexts
+BeamState = BeamSettings
+
 @dataclass
 class BeamSystemSettings:
     """
@@ -1640,20 +1757,29 @@ class BeamSystemSettings:
         self.enabled = parse_bool_like(self.enabled, default=True)
         self.default_beam = maybe_from_dict(BeamSettings, self.default_beam, mode=mode) or BeamSettings(_mode=mode)
 
-        def _lim(val, unit):
+        def _lim(val, unit, name):
             if val is None: return None
             if isinstance(val, (list, tuple)) and len(val) == 2:
-                return (ensure_quantity(val[0], unit), ensure_quantity(val[1], unit))
+                a = ensure_quantity(val[0], unit)
+                b = ensure_quantity(val[1], unit)
+                if a is None or b is None:
+                    note_or_raise(self.extra, f"{name}_limits",
+                                  TypeError(f"{name} limits must be quantities in {unit}: got {val!r}"),
+                                  mode=mode, raw=val)
+                    return None
+                return (a, b)
+            note_or_raise(self.extra, f"{name}_limits",
+                          TypeError(f"{name} limits must be a (min,max) pair: got {val!r}"),
+                          mode=mode, raw=val)
             return None
 
-        self.voltage_limits = _lim(self.voltage_limits, "kV")
-        self.beam_current_limits = _lim(self.beam_current_limits, "nA")
-        self.convergence_angle_limits = _lim(self.convergence_angle_limits, "mrad")
+        self.voltage_limits = _lim(self.voltage_limits, "kV", "BeamSystemSettings.voltage")
+        self.beam_current_limits = _lim(self.beam_current_limits, "nA", "BeamSystemSettings.beam_current")
+        self.convergence_angle_limits = _lim(self.convergence_angle_limits, "mrad", "BeamSystemSettings.convergence_angle")
         self.spot_size_limits = parse_optional_pair_int_like(self.spot_size_limits, name="BeamSystemSettings.spot_size_limits", sort=False, strict=strict, extra=self.extra)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        mode = as_parse_mode(self._mode if mode is None else mode)
-        strict = is_strict(mode)
+        mode, strict = _setup_validate(self._mode, mode)
         ok = self.default_beam.validate(mode=mode)
 
         def _check(rng, name):
@@ -1661,15 +1787,21 @@ class BeamSystemSettings:
                 mn, mx = rng
                 if mn > mx:
                     note_or_raise(self.extra, name, ValueError(f"{name} invalid: min > max"), mode=mode)
-                    if not strict:
-                        try: setattr(self, name, (mx, mn))
-                        except Exception: pass
-                    return False
+                    if strict:
+                        return False
+                    # Heal: Swap
+                    try: setattr(self, name, (mx, mn))
+                    except Exception: pass
 
+                # Check for negative lower bounds
                 if mn.magnitude < 0:
                     note_or_raise(self.extra, f"BeamSystemSettings.{name}",
                                   ValueError(f"{name} invalid: min < 0"), mode=mode)
-                    return False
+                    if strict:
+                         return False
+                    # Heal: Clamp min to 0
+                    try: setattr(self, name, (Q_(0, mn.units), mx))
+                    except: pass
             return True
 
         ok = _check(self.voltage_limits, "voltage_limits") and ok
@@ -1720,8 +1852,7 @@ class BeamSystemSettings:
             "spot_size_limits": self.spot_size_limits,
             "convergence_angle_limits_mrad": _s_lim(self.convergence_angle_limits, "mrad"),
         }
-        add_extra_if_any(d, self.extra)
-        return _jsonable(drop_none_keys(d))
+        return _finish_to_dict(d, self.extra)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "BeamSystemSettings":
@@ -1803,33 +1934,41 @@ class DetectorSettings:
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         # VALIDATION: Semantic logic
-        mode = as_parse_mode(self._mode if mode is None else mode)
-        strict = is_strict(mode)
+        mode, strict = _setup_validate(self._mode, mode)
         ok = True
 
         if self.exposure is not None:
              if self.exposure.magnitude <= 0:
                  note_or_raise(self.extra, "DetectorSettings.exposure", ValueError("Exposure must be > 0"), mode=mode)
-                 ok = False
+                 if strict:
+                     ok = False
+                 else:
+                     self.exposure = None
 
         if self.binning_xy:
              # Semantic check: Binning must be positive integers
              if self.binning_xy[0] <= 0 or self.binning_xy[1] <= 0:
-                 note_or_raise(self.extra, "DetectorSettings.binning_xy", ValueError("binning_xy must be >= 0"), mode=mode, raw=self.binning_xy)
-                 ok = False
-                 if not strict:
-                     # Repair: Disable explicit binning if invalid
+                 note_or_raise(self.extra, "DetectorSettings.binning_xy", ValueError("binning_xy must be > 0"), mode=mode, raw=self.binning_xy)
+                 if strict:
+                     ok = False
+                 else:
                      self.binning_xy = None
 
         if self.frame_integration is not None and self.frame_integration < 1:
             note_or_raise(self.extra, "DetectorSettings.frame_integration",
                           ValueError(f"Frame integration must be >= 1, got {self.frame_integration}"), mode=mode)
-            ok = False
+            if strict:
+                ok = False
+            else:
+                self.frame_integration = 1
 
         if self.gain_index is not None and self.gain_index < 0:
             note_or_raise(self.extra, "DetectorSettings.gain_index",
                           ValueError("Gain index must be >= 0"), mode=mode)
-            ok = False
+            if strict:
+                ok = False
+            else:
+                self.gain_index = 0
 
         if self.roi:
             if not self.roi.validate(mode=mode):
@@ -1848,8 +1987,7 @@ class DetectorSettings:
             "digital_rotation_deg": self.digital_rotation_deg,
             "roi": self.roi.to_dict() if self.roi else None,
         }
-        add_extra_if_any(d, self.extra)
-        return _jsonable(drop_none_keys(d))
+        return _finish_to_dict(d, self.extra)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "DetectorSettings":
@@ -1882,6 +2020,9 @@ class DetectorSettings:
             digital_rotation_deg=d.get("digital_rotation_deg"),
             extra=extra, _mode=mode
         )
+
+# Alias for semantic clarity in Read-Only contexts
+DetectorState = DetectorSettings
 
 @dataclass
 class DetectorCapabilities:
@@ -1918,7 +2059,8 @@ class DetectorCapabilities:
     digital_rotation_deg_min: Optional[float] = None
     digital_rotation_deg_max: Optional[float] = None
     extra: Extras = field(default_factory=Extras)
-    _mode: ParseMode = field(default=ParseMode.LENIENT, repr=False)
+    # FIX: compare=False ensures objects with same data but different mode are equal
+    _mode: ParseMode = field(default=ParseMode.LENIENT, repr=False, compare=False)
 
     def __post_init__(self):
         mode, strict, self.extra = _setup_init(self, self._mode, "DetectorCapabilities")
@@ -1952,70 +2094,102 @@ class DetectorCapabilities:
         self.can_digital_rotation = parse_optional_bool_like(self.can_digital_rotation, name="DetectorCapabilities.can_digital_rotation", strict=False, extra=self.extra)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        # VALIDATION: Check consistency (min <= max) and non-negativity.
-        # We trust types are correct because __post_init__ guaranteed it.
-        mode = as_parse_mode(self._mode if mode is None else mode)
+        mode, strict = _setup_validate(self._mode, mode)
         ok = True
 
-        def _check_range(min_val, max_val, name):
+        def _check_range(min_val, max_val, name, min_attr, max_attr):
             if min_val is not None and max_val is not None:
                 if min_val > max_val:
                     note_or_raise(self.extra, name, ValueError(f"{name} invalid: min > max ({min_val} > {max_val})"), mode=mode)
-                    return False
+                    if strict:
+                        return False
+                    # Heal: Swap limits
+                    try:
+                        setattr(self, min_attr, max_val)
+                        setattr(self, max_attr, min_val)
+                    except Exception:
+                        pass
             return True
 
-        def _check_pos(val, name):
+        def _check_pos(val, name, attr_name):
             if val is not None and val < 0:
                 note_or_raise(self.extra, name, ValueError(f"{name} must be >= 0"), mode=mode, raw=val)
-                return False
+                if strict:
+                    return False
+                # Heal: Clamp to 0
+                setattr(self, attr_name, 0.0)
             return True
 
         # 1. Range Consistency
-        ok = _check_range(self.binning_index_min, self.binning_index_max, "DetectorCapabilities.binning_index") and ok
-        ok = _check_range(self.frame_integration_min, self.frame_integration_max, "DetectorCapabilities.frame_integration") and ok
-        ok = _check_range(self.gain_index_min, self.gain_index_max, "DetectorCapabilities.gain_index") and ok
-        ok = _check_range(self.offset_index_min, self.offset_index_max, "DetectorCapabilities.offset_index") and ok
-        ok = _check_range(self.exposure_ms_min, self.exposure_ms_max, "DetectorCapabilities.exposure_ms") and ok
+        # Note: We pass attribute names to allow swapping in _check_range
+        ok = _check_range(self.binning_index_min, self.binning_index_max, "DetectorCapabilities.binning_index", "binning_index_min", "binning_index_max") and ok
+        ok = _check_range(self.frame_integration_min, self.frame_integration_max, "DetectorCapabilities.frame_integration", "frame_integration_min", "frame_integration_max") and ok
+        ok = _check_range(self.gain_index_min, self.gain_index_max, "DetectorCapabilities.gain_index", "gain_index_min", "gain_index_max") and ok
+        ok = _check_range(self.offset_index_min, self.offset_index_max, "DetectorCapabilities.offset_index", "offset_index_min", "offset_index_max") and ok
+        ok = _check_range(self.exposure_ms_min, self.exposure_ms_max, "DetectorCapabilities.exposure_ms", "exposure_ms_min", "exposure_ms_max") and ok
 
         # 2. Physical Non-negativity
-        ok = _check_pos(self.exposure_ms_min, "DetectorCapabilities.exposure_ms_min") and ok
+        ok = _check_pos(self.exposure_ms_min, "DetectorCapabilities.exposure_ms_min", "exposure_ms_min") and ok
 
         # 3. Tuple consistency (ROI/Binning)
         if self.roi_size_min and self.roi_size_max:
              if self.roi_size_min[0] > self.roi_size_max[0] or self.roi_size_min[1] > self.roi_size_max[1]:
                  note_or_raise(self.extra, "DetectorCapabilities.roi_size", ValueError("ROI size min > max"), mode=mode)
-                 ok = False
+                 if strict:
+                     ok = False
+                 else:
+                     # Heal: Swap X and Y components individually
+                     new_min_x = min(self.roi_size_min[0], self.roi_size_max[0])
+                     new_max_x = max(self.roi_size_min[0], self.roi_size_max[0])
+                     new_min_y = min(self.roi_size_min[1], self.roi_size_max[1])
+                     new_max_y = max(self.roi_size_min[1], self.roi_size_max[1])
+                     self.roi_size_min = (new_min_x, new_min_y)
+                     self.roi_size_max = (new_max_x, new_max_y)
 
         return ok
 
     def supports(self, settings: DetectorSettings) -> bool:
-        # We assume 'settings' is already internally validated (Integrity of Meaning)
-        # We check 'Integrity of Compatibility'
+        if settings.detector_id:
+             pass
 
         if settings.binning_xy:
             bx, by = settings.binning_xy
-            # Check if this binning level is allowed
             if self.binning_xy_max:
                 max_x, max_y = self.binning_xy_max
                 if bx > max_x or by > max_y: return False
-            # Check if binning is enabled at all
             if self.can_binning is False and (bx > 1 or by > 1): return False
 
         if settings.exposure:
-            # Check min/max exposure
             if self.exposure_ms_min and settings.exposure < Q_(self.exposure_ms_min, 'ms'): return False
             if self.exposure_ms_max and settings.exposure > Q_(self.exposure_ms_max, 'ms'): return False
 
         return True
 
     def to_dict(self) -> dict:
-        d: Dict[str, Any] = {}
-        for f in fields(DetectorCapabilities):
-            if f.name == "extra": continue
-            v = getattr(self, f.name)
-            if v is not None: d[f.name] = v
-        add_extra_if_any(d, self.extra)
-        return _jsonable(drop_none_keys(d))
+        # FIX: Explicit listing instead of dynamic iteration
+        d = {
+            "can_binning": self.can_binning,
+            "binning_index_min": self.binning_index_min,
+            "binning_index_max": self.binning_index_max,
+            "binning_xy_min": list(self.binning_xy_min) if self.binning_xy_min else None,
+            "binning_xy_max": list(self.binning_xy_max) if self.binning_xy_max else None,
+            "exposure_ms_min": self.exposure_ms_min,
+            "exposure_ms_max": self.exposure_ms_max,
+            "frame_integration_min": self.frame_integration_min,
+            "frame_integration_max": self.frame_integration_max,
+            "roi_size_min": list(self.roi_size_min) if self.roi_size_min else None,
+            "roi_size_max": list(self.roi_size_max) if self.roi_size_max else None,
+            "can_gain": self.can_gain,
+            "gain_index_min": self.gain_index_min,
+            "gain_index_max": self.gain_index_max,
+            "can_offset": self.can_offset,
+            "offset_index_min": self.offset_index_min,
+            "offset_index_max": self.offset_index_max,
+            "can_digital_rotation": self.can_digital_rotation,
+            "digital_rotation_deg_min": self.digital_rotation_deg_min,
+            "digital_rotation_deg_max": self.digital_rotation_deg_max,
+        }
+        return _finish_to_dict(d, self.extra)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "DetectorCapabilities":
@@ -2023,26 +2197,34 @@ class DetectorCapabilities:
         if isinstance(d, DetectorCapabilities): return replace(d, _mode=mode)
         if not isinstance(d, dict): return DetectorCapabilities(_mode=mode)
 
-        known = {f.name for f in fields(DetectorCapabilities)} | {"roi_min", "roi_max", "extra"}
+        # FIX: Explicit extraction to match pattern and collect extras
+        field_names = {f.name for f in fields(DetectorCapabilities)}
+        known = field_names | {"roi_min", "roi_max", "extra"}
         extra = collect_extra(d, known, owner="DetectorCapabilities")
 
-        # Helper to extract kwargs manually since this is a complex mix of types
-        kwargs: Dict[str, Any] = {}
-        pair_fields = {"binning_xy_min", "binning_xy_max", "roi_size_min", "roi_size_max"}
-        int_fields = {"binning_index_min", "binning_index_max", "frame_integration_min", "frame_integration_max", "gain_index_min", "gain_index_max", "offset_index_min", "offset_index_max"}
-        float_fields = {"exposure_ms_min", "exposure_ms_max", "digital_rotation_deg_min", "digital_rotation_deg_max"}
-        bool_fields = {"can_binning", "can_gain", "can_offset", "can_digital_rotation"}
-
-        for f in fields(DetectorCapabilities):
-            if f.name == "extra" or f.name not in d: continue
-            v = d.get(f.name)
-            if f.name in pair_fields: kwargs[f.name] = parse_optional_pair_int_like(v, name=f"DetectorCapabilities.{f.name}", strict=False, extra=extra)
-            elif f.name in int_fields: kwargs[f.name] = parse_optional_int_like(v, name=f"DetectorCapabilities.{f.name}", strict=False, extra=extra)
-            elif f.name in float_fields: kwargs[f.name] = parse_optional_float_like(v, name=f"DetectorCapabilities.{f.name}", strict=False, extra=extra)
-            elif f.name in bool_fields: kwargs[f.name] = parse_optional_bool_like(v, name=f"DetectorCapabilities.{f.name}", strict=False, extra=extra)
-            else: kwargs[f.name] = v
-
-        return DetectorCapabilities(**kwargs, extra=extra, _mode=mode)
+        return DetectorCapabilities(
+            can_binning=d.get("can_binning"),
+            binning_index_min=d.get("binning_index_min"),
+            binning_index_max=d.get("binning_index_max"),
+            binning_xy_min=d.get("binning_xy_min"),
+            binning_xy_max=d.get("binning_xy_max"),
+            exposure_ms_min=d.get("exposure_ms_min"),
+            exposure_ms_max=d.get("exposure_ms_max"),
+            frame_integration_min=d.get("frame_integration_min"),
+            frame_integration_max=d.get("frame_integration_max"),
+            roi_size_min=d.get("roi_size_min", d.get("roi_min")),
+            roi_size_max=d.get("roi_size_max", d.get("roi_max")),
+            can_gain=d.get("can_gain"),
+            gain_index_min=d.get("gain_index_min"),
+            gain_index_max=d.get("gain_index_max"),
+            can_offset=d.get("can_offset"),
+            offset_index_min=d.get("offset_index_min"),
+            offset_index_max=d.get("offset_index_max"),
+            can_digital_rotation=d.get("can_digital_rotation"),
+            digital_rotation_deg_min=d.get("digital_rotation_deg_min"),
+            digital_rotation_deg_max=d.get("digital_rotation_deg_max"),
+            extra=extra, _mode=mode
+        )
 
 @dataclass
 class DetectorSystemSettings:
@@ -2134,8 +2316,7 @@ class DetectorSystemSettings:
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         """Validate detector-system semantics and cross-field consistency."""
-        mode = as_parse_mode(self._mode if mode is None else mode)
-        strict = is_strict(mode)
+        mode, strict = _setup_validate(self._mode, mode)
         ok = True
 
         # Rule 2B: Cross-Field Consistency
@@ -2156,8 +2337,10 @@ class DetectorSystemSettings:
                     ValueError(f"Selected default '{self.default_detector_id}' is unknown."),
                     mode=mode
                 )
-                ok = False
-                if not strict: self.default_detector_id = None
+                if strict:
+                    ok = False
+                else:
+                    self.default_detector_id = None
 
         # Check 2: Configuration Completeness
         # If a detector is 'available', it MUST have settings and capabilities to be usable.
@@ -2169,9 +2352,9 @@ class DetectorSystemSettings:
                 ValueError(f"Available detectors missing default settings: {missing_defaults}"),
                 mode=mode
             )
-            # We do not set ok=False here necessarily, unless strict strictness is required.
-            # But usually, this implies a broken config.
-            ok = False
+            # Generally broken config, but in lenient we might just proceed.
+            if strict:
+                ok = False
 
         missing_caps = ids_available - ids_caps
         if missing_caps:
@@ -2181,12 +2364,9 @@ class DetectorSystemSettings:
                 ValueError(f"Available detectors missing capabilities: {missing_caps}"),
                 mode=mode
             )
-            ok = False
+            if strict:
+                ok = False
 
-        # Note: It is generally OK for defaults/caps to exist for detectors NOT in available
-        # (e.g. offline hardware), so we do not check the reverse direction.
-
-        # Rule 2A: Recursive Validation
         for ds in self.defaults_by_id.values():
             ok = ds.validate(mode=mode) and ok
 
@@ -2196,10 +2376,7 @@ class DetectorSystemSettings:
         return ok
 
     def is_supported(self, settings: DetectorSettings) -> bool:
-        """
-        Runtime Gatekeeper: Checks if settings are supported by the specific detector hardware.
-        """
-        if not settings.detector_id: return False  # Can't check if we don't know who it is
+        if not settings.detector_id: return False
 
         caps = self.capabilities_by_id.get(settings.detector_id)
         if not caps:
@@ -2217,8 +2394,7 @@ class DetectorSystemSettings:
             "defaults_by_id": {k: v.to_dict() for k, v in self.defaults_by_id.items()},
             "capabilities_by_id": {k: v.to_dict() for k, v in self.capabilities_by_id.items()},
         }
-        add_extra_if_any(d, self.extra)
-        return _jsonable(drop_none_keys(d))
+        return _finish_to_dict(d, self.extra)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "DetectorSystemSettings":
@@ -2250,7 +2426,7 @@ class ImageOutputSettings:
     file_format: str = "tiff"
     path: Optional[str] = None
     extra: Extras = field(default_factory=Extras)
-    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False, compare=False)
 
     def __post_init__(self):
         mode, strict, self.extra = _setup_init(self, self._mode, "ImageOutputSettings")
@@ -2258,21 +2434,22 @@ class ImageOutputSettings:
         self.file_format = self.file_format.lower()
         self.path = parse_optional_str_like(self.path, name="ImageOutputSettings.path", strict=strict, extra=self.extra)
 
-    def validate(self, *, mode=None):
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        mode, strict = _setup_validate(self._mode, mode)
+
         if self.file_format not in {"tiff", "tif", "png", "jpg", "jpeg", "bmp"}:
-            if is_strict(mode or self._mode):
-                raise ValueError(f"Unsupported format: {self.file_format}")
+            note_or_raise(self.extra, "ImageOutputSettings.file_format", ValueError(f"Unsupported format: {self.file_format}"), mode=mode)
+            if strict:
+                return False
             self.file_format = "tiff"
-            return False
         return True
 
-    def to_dict(self):
+    def to_dict(self) -> dict:
         d = {"file_format": self.file_format, "path": self.path}
-        add_extra_if_any(d, self.extra)
-        return _jsonable(drop_none_keys(d))
+        return _finish_to_dict(d, self.extra)
 
     @staticmethod
-    def from_dict(d, *, mode=ParseMode.STRICT):
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "ImageOutputSettings":
         if isinstance(d, ImageOutputSettings): return replace(d, _mode=mode)
         if not isinstance(d, dict): return ImageOutputSettings(_mode=mode)
         return ImageOutputSettings(
@@ -2283,105 +2460,7 @@ class ImageOutputSettings:
         )
 
 @dataclass
-class AcquisitionRequest:
-    """
-    An executable command to acquire an image.
-
-    A control-plane object that combines detector settings with output preferences.
-
-    Attributes:
-        detector_id: The ID of the detector to use (Required).
-        detector: Specific settings for this acquisition.
-        image: Output settings (format, path).
-
-    Notes:
-        In `STRICT` mode, this object requires a valid `detector_id` to be instantiated.
-        It enforces consistency between the outer `detector_id` and the inner `detector.detector_id`.
-    """
-    detector_id: Optional[str] = None
-    detector: DetectorSettings = field(default_factory=DetectorSettings)
-    image: ImageOutputSettings = field(default_factory=ImageOutputSettings)
-    extra: Extras = field(default_factory=Extras)
-    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
-
-    def __post_init__(self):
-        # NORMALIZATION:
-        # 1. Structure Coercion (Dict -> Dataclass)
-        # 2. Patch missing holes (Copy IDs if one is missing)
-        mode, strict, self.extra = _setup_init(self, self._mode, "AcquisitionRequest")
-
-        self.detector = maybe_from_dict(DetectorSettings, self.detector, mode=mode) or DetectorSettings(_mode=mode)
-        self.image = maybe_from_dict(ImageOutputSettings, self.image, mode=mode) or ImageOutputSettings(_mode=mode)
-        self.detector_id = parse_optional_id_like(self.detector_id, name="id", strict=strict, extra=self.extra)
-
-        # Logic: Patching holes.
-        # DO NOT overwrite if both exist. That hides conflicts.
-        if self.detector_id is None and self.detector.detector_id is not None:
-            self.detector_id = self.detector.detector_id
-        elif self.detector.detector_id is None and self.detector_id is not None:
-            self.detector.detector_id = self.detector_id
-
-    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        # VALIDATION: Consistency & Readiness
-        mode = as_parse_mode(self._mode if mode is None else mode)
-        strict = is_strict(mode)
-        ok = True
-
-        # Rule 1: Must have an ID to execute
-        if not self.detector_id:
-            note_or_raise(self.extra, "AcquisitionRequest.detector_id", ValueError("detector_id is required"), mode=mode)
-            ok = False
-
-        # Rule 2: Sub-objects must be valid
-        ok = self.detector.validate(mode=mode) and ok
-        ok = self.image.validate(mode=mode) and ok
-
-        # Rule 3: Cross-field consistency (The Conflict Case)
-        if self.detector.detector_id and self.detector_id and self.detector.detector_id != self.detector_id:
-            note_or_raise(self.extra, "AcquisitionRequest.id_mismatch", ValueError(
-                f"Ambiguous detector IDs: outer={self.detector_id}, inner={self.detector.detector_id}"), mode=mode)
-            ok = False
-            # Healing (Lenient only)
-            if not strict:
-                self.detector.detector_id = self.detector_id
-
-        return ok
-
-    def to_dict(self) -> dict:
-        d = {
-            "detector_id": self.detector_id,
-            "detector": self.detector.to_dict(),
-            "image": self.image.to_dict(),
-        }
-        add_extra_if_any(d, self.extra)
-        return _jsonable(drop_none_keys(d))
-
-    @staticmethod
-    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "AcquisitionRequest":
-        mode = as_parse_mode(mode)
-        if isinstance(d, AcquisitionRequest): return replace(d, _mode=mode)
-        if not isinstance(d, dict): return AcquisitionRequest(_mode=mode)
-        extra = collect_extra(d, ("detector_id", "detector", "image", "extra"), owner="AcquisitionRequest")
-        return AcquisitionRequest(
-            detector_id=d.get("detector_id"),
-            detector=d.get("detector"),
-            image=d.get("image"),
-            extra=extra, _mode=mode
-        )
-
-@dataclass
 class Aperture:
-    """
-    State of a specific beam-limiting aperture mechanism.
-
-    Tracks insertion status, selected size, and mechanical alignment.
-
-    Attributes:
-        aperture_id: Unique ID of the mechanism (e.g., "condenser", "objective").
-        inserted: True if the aperture is currently inserted in the beam path.
-        size_index: The selected aperture strip index.
-        position: The physical alignment of the aperture mechanism.
-    """
     aperture_id: Optional[str] = None
     inserted: bool = False
     size_index: Optional[int] = None
@@ -2397,7 +2476,7 @@ class Aperture:
         self.position = maybe_from_dict(Point, self.position, extra=self.extra, key="Aperture.position", mode=mode)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        mode = as_parse_mode(self._mode if mode is None else mode)
+        mode, strict = _setup_validate(self._mode, mode)
         ok = True
 
         if self.size_index is not None and self.size_index < 0:
@@ -2406,13 +2485,22 @@ class Aperture:
                 ValueError(f"size_index must be >= 0, got {self.size_index}"),
                 mode=mode, raw=self.size_index
             )
-            ok = False
+            if strict:
+                ok = False
+            else:
+                self.size_index = None  # Heal: Unknown size
 
         if self.position is not None:
+            # Check if the nested object is valid
             if not self.position.validate(mode=mode):
                 note_or_raise(self.extra, "Aperture.position", ValueError("Invalid aperture position coordinates"),
                               mode=mode)
-                ok = False
+                if strict:
+                    ok = False
+                else:
+                    # Heal: Discard the invalid position data, keep the aperture info
+                    self.position = None
+
         return ok
 
     def to_dict(self) -> dict:
@@ -2422,8 +2510,7 @@ class Aperture:
             "size_index": self.size_index,
             "position": self.position.to_dict() if self.position else None
         }
-        add_extra_if_any(d, self.extra)
-        return _jsonable(drop_none_keys(d))
+        return _finish_to_dict(d, self.extra)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "Aperture":
@@ -2451,20 +2538,20 @@ class MicroscopeState:
         mode: The optical mode (e.g., "TEM", "STEM").
         stage_position: Current coordinates of the stage.
         beam: Current state of the electron beam.
-        apertures: Dictionary of aperture states.
-        detectors: Dictionary of detector settings.
+        apertures: Dictionary of current aperture states.
+        detectors: Dictionary of current detector States.
         active_detector_ids: List of detectors currently marked as active.
         primary_detector_id: The ID of the currently selected main detector.
 
     Notes:
         Typically instantiated in `LENIENT` mode for logging/telemetry to preserve data despite partial failures.
     """
-    timestamp: str = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc).timestamp())
+    timestamp: str = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc).isoformat())
     mode: Optional[str] = None
     stage_position: StagePosition = field(default_factory=StagePosition)
-    beam: BeamSettings = field(default_factory=BeamSettings)
+    beam: BeamState = field(default_factory=BeamState)
     apertures: Dict[str, Aperture] = field(default_factory=dict)
-    detectors: Dict[str, DetectorSettings] = field(default_factory=dict)
+    detectors: Dict[str, DetectorState] = field(default_factory=dict)
     active_detector_ids: List[str] = field(default_factory=list)
     primary_detector_id: Optional[str] = None
     extra: Extras = field(default_factory=Extras)
@@ -2480,51 +2567,25 @@ class MicroscopeState:
         self.timestamp = str(self.timestamp)
         self.mode = parse_optional_str_like(self.mode, name="MicroscopeState.mode", strict=strict, extra=self.extra)
         self.stage_position = maybe_from_dict(StagePosition, self.stage_position, mode=mode) or StagePosition()
-        self.beam = maybe_from_dict(BeamSettings, self.beam, mode=mode) or BeamSettings()
+        self.beam = maybe_from_dict(BeamState, self.beam, mode=mode) or BeamState()
 
-        raw_aps = self.apertures or {}
-        self.apertures = {}
-        for k, v in raw_aps.items():
-            ap_key = parse_optional_id_like(k, name="MicroscopeState.apertures.key", strict=strict, extra=self.extra)
-            if ap_key is None:
-                if self.extra:
-                    self.extra.notes[f"MicroscopeState.apertures.{k}_raw_key"] = "Invalid ID"
-                continue
+        self.apertures = _normalize_keyed_map(
+            target_cls=Aperture,
+            raw_map=self.apertures,
+            id_field="aperture_id",
+            owner_name="MicroscopeState.apertures",
+            mode=mode,
+            extra=self.extra
+        )
 
-            ap_obj = maybe_from_dict(Aperture, v, mode=mode)
-            if ap_obj is None:
-                ap_obj = Aperture(_mode=mode)
-
-            if ap_obj.aperture_id is None:
-                ap_obj.aperture_id = ap_key
-            elif ap_obj.aperture_id != ap_key:
-                note_or_raise(self.extra, f"MicroscopeState.apertures.{ap_key}.id_mismatch",
-                              ValueError(f"Aperture key '{ap_key}' != internal id '{ap_obj.aperture_id}'"), mode=mode)
-                ap_obj.aperture_id = ap_key
-
-            self.apertures[ap_key] = ap_obj
-
-        raw_dets = self.detectors or {}
-        self.detectors = {}
-        for k, v in raw_dets.items():
-            det_key = parse_optional_id_like(k, name="MicroscopeState.detectors.key", strict=strict, extra=self.extra)
-            if det_key is None:
-                if self.extra:
-                    self.extra.notes[f"MicroscopeState.detectors.{k}_raw_key"] = "Invalid ID"
-                continue
-
-            det_obj = maybe_from_dict(DetectorSettings, v, mode=mode)
-            if det_obj is None:
-                det_obj = DetectorSettings(_mode=mode)
-
-            if det_obj.detector_id is None:
-                det_obj.detector_id = det_key
-            elif det_obj.detector_id != det_key:
-                note_or_raise(self.extra, f"MicroscopeState.detectors.{det_key}.id_mismatch",
-                              ValueError(f"Detector key '{det_key}' != internal id '{det_obj.detector_id}'"), mode=mode)
-                det_obj.detector_id = det_key
-
-            self.detectors[det_key] = det_obj
+        self.detectors = _normalize_keyed_map(
+            target_cls=DetectorState,
+            raw_map=self.detectors,
+            id_field="detector_id",
+            owner_name="MicroscopeState.detectors",
+            mode=mode,
+            extra=self.extra
+        )
 
         raw_ids = self.active_detector_ids or []
         self.active_detector_ids = []
@@ -2539,8 +2600,7 @@ class MicroscopeState:
                                                           extra=self.extra)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        mode = as_parse_mode(self._mode if mode is None else mode)
-        strict = is_strict(mode)
+        mode, strict = _setup_validate(self._mode, mode)
         ok = True
 
         ok = self.stage_position.validate(mode=mode) and ok
@@ -2556,7 +2616,8 @@ class MicroscopeState:
             if det_id not in self.detectors:
                 note_or_raise(self.extra, "MicroscopeState.active_detector_ids",
                               ValueError(f"Active detector '{det_id}' not found in detectors list"), mode=mode)
-                ok = False
+                if strict:
+                    ok = False
             else:
                 valid_ids.append(det_id)
 
@@ -2576,8 +2637,7 @@ class MicroscopeState:
             "active_detector_ids": self.active_detector_ids,
             "primary_detector_id": self.primary_detector_id
         }
-        add_extra_if_any(d, self.extra)
-        return _jsonable(drop_none_keys(d))
+        return _finish_to_dict(d, self.extra)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "MicroscopeState":
@@ -2601,23 +2661,6 @@ class MicroscopeState:
 
 @dataclass
 class MicroscopeImageMetadata:
-    """
-    Archival metadata associated with an acquired image.
-
-    Contains flat, JSON-serializable acquisition parameters and the microscope state snapshot.
-
-    Attributes:
-        version: Metadata schema version.
-        created_at: ISO8601 creation timestamp.
-        magnification: The indicated magnification.
-        camera_length_mm: The indicated camera length (Diffraction mode).
-        pixel_size_nm: Tuple of (x, y) pixel size.
-        image_size_px: Tuple of (width, height).
-        accelerating_voltage_kv: High tension.
-        beam_current_na: Beam current.
-        exposure_ms: Exposure time.
-        microscope_state: Full snapshot of the microscope state.
-    """
     version: str = str(METADATA_VERSION)
     created_at: str = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc).isoformat())
     magnification: Optional[float] = None
@@ -2637,28 +2680,37 @@ class MicroscopeImageMetadata:
 
         # Scalar normalizations using parsers
         self.magnification = parse_optional_float_like(self.magnification, name="mag", strict=strict, extra=self.extra)
-        self.camera_length_mm = parse_optional_float_like(self.camera_length_mm, name="cl", strict=strict, extra=self.extra)
-        self.accelerating_voltage_kv = parse_optional_float_like(self.accelerating_voltage_kv, name="ht", strict=strict, extra=self.extra)
-        self.beam_current_na = parse_optional_float_like(self.beam_current_na, name="beam", strict=strict, extra=self.extra)
+        self.camera_length_mm = parse_optional_float_like(self.camera_length_mm, name="cl", strict=strict,
+                                                          extra=self.extra)
+        self.accelerating_voltage_kv = parse_optional_float_like(self.accelerating_voltage_kv, name="ht", strict=strict,
+                                                                 extra=self.extra)
+        self.beam_current_na = parse_optional_float_like(self.beam_current_na, name="beam", strict=strict,
+                                                         extra=self.extra)
         self.exposure_ms = parse_optional_float_like(self.exposure_ms, name="exp", strict=strict, extra=self.extra)
-        self.pixel_size_nm = parse_optional_pair_float_like(self.pixel_size_nm, name="px", strict=strict, extra=self.extra)
-        self.image_size_px = parse_optional_pair_int_like(self.image_size_px, name="res", strict=strict, extra=self.extra)
+        self.pixel_size_nm = parse_optional_pair_float_like(self.pixel_size_nm, name="px", strict=strict,
+                                                            extra=self.extra)
+        self.image_size_px = parse_optional_pair_int_like(self.image_size_px, name="res", strict=strict,
+                                                          extra=self.extra)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        mode = as_parse_mode(self._mode if mode is None else mode)
+        mode, strict = _setup_validate(self._mode, mode)
         ok = True
+
         if self.microscope_state:
             ok = self.microscope_state.validate(mode=mode) and ok
 
-        def _check_pos(val, name):
+        def _check_pos(val, name, attr_name):
             if val is not None and val < 0:
                 note_or_raise(self.extra, name, ValueError(f"{name} must be >= 0"), mode=mode, raw=val)
-                return False
+                if strict:
+                    return False
+                setattr(self, attr_name, None)  # Heal: Set to Unknown
             return True
 
-        ok = _check_pos(self.magnification, "magnification") and ok
-        ok = _check_pos(self.exposure_ms, "exposure_ms") and ok
-        ok = _check_pos(self.accelerating_voltage_kv, "accelerating_voltage_kv") and ok
+        ok = _check_pos(self.magnification, "magnification", "magnification") and ok
+        ok = _check_pos(self.exposure_ms, "exposure_ms", "exposure_ms") and ok
+        ok = _check_pos(self.accelerating_voltage_kv, "accelerating_voltage_kv", "accelerating_voltage_kv") and ok
+
         return ok
 
     def to_dict(self) -> dict:
@@ -2674,8 +2726,7 @@ class MicroscopeImageMetadata:
             "exposure_ms": self.exposure_ms,
             "microscope_state": self.microscope_state.to_dict() if self.microscope_state else None
         }
-        add_extra_if_any(d, self.extra)
-        return _jsonable(drop_none_keys(d))
+        return _finish_to_dict(d, self.extra)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "MicroscopeImageMetadata":
@@ -2860,7 +2911,7 @@ class SystemInfo:
     application: Optional[str] = None
     application_version: Optional[str] = None
     extra: Extras = field(default_factory=Extras)
-    _mode: ParseMode = field(default=ParseMode.LENIENT, repr=False)
+    _mode: ParseMode = field(default=ParseMode.LENIENT, repr=False, compare=False)
 
     def __post_init__(self):
         mode, strict, self.extra = _setup_init(self, self._mode, "SystemInfo")
@@ -2870,30 +2921,58 @@ class SystemInfo:
              setattr(self, f.name, parse_optional_str_like(v, name=f"SystemInfo.{f.name}", strict=strict, extra=self.extra) or "Unknown")
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        mode = as_parse_mode(self._mode if mode is None else mode)
+        mode, strict = _setup_validate(self._mode, mode)
+
         ip = self.ip_address.strip()
         if ip and ip != "Unknown":
             try:
                 ipaddress.ip_address(ip)
             except Exception:
                 note_or_raise(self.extra, "SystemInfo.ip_address", ValueError(f"Invalid IP: {self.ip_address!r}"), mode=mode, raw=self.ip_address)
+                if strict:
+                    return False
                 self.ip_address = "Unknown"
-                return False
         return True
 
     def to_dict(self) -> dict:
-        d = {f.name: getattr(self, f.name) for f in fields(SystemInfo) if f.name not in ("extra", "_mode")}
-        add_extra_if_any(d, self.extra)
-        return _jsonable(drop_none_keys(d))
+        # FIX: Explicit listing
+        d = {
+            "name": self.name,
+            "ip_address": self.ip_address,
+            "manufacturer": self.manufacturer,
+            "model": self.model,
+            "serial_number": self.serial_number,
+            "hardware_version": self.hardware_version,
+            "software_version": self.software_version,
+            "supertem_version": self.supertem_version,
+            "application": self.application,
+            "application_version": self.application_version,
+        }
+        return _finish_to_dict(d, self.extra)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "SystemInfo":
         mode = as_parse_mode(mode)
         if isinstance(d, SystemInfo): return replace(d, _mode=mode)
         if not isinstance(d, dict): return SystemInfo(_mode=mode)
+
         known = {f.name for f in fields(SystemInfo)} | {"extra"}
         extra = collect_extra(d, known, owner="SystemInfo")
-        return SystemInfo(**{k: d.get(k) for k in known if k != "extra"}, extra=extra, _mode=mode)
+
+        return SystemInfo(
+            name=d.get("name"),
+            ip_address=d.get("ip_address"),
+            manufacturer=d.get("manufacturer"),
+            model=d.get("model"),
+            serial_number=d.get("serial_number"),
+            hardware_version=d.get("hardware_version"),
+            software_version=d.get("software_version"),
+            supertem_version=d.get("supertem_version", __version__),
+            application=d.get("application"),
+            application_version=d.get("application_version"),
+            extra=extra,
+            _mode=mode
+        )
 
 @dataclass
 class SystemSettings:
@@ -2912,42 +2991,54 @@ class SystemSettings:
     beam_system: BeamSystemSettings = field(default_factory=BeamSystemSettings)
     detector_system: DetectorSystemSettings = field(default_factory=DetectorSystemSettings)
     info: SystemInfo = field(default_factory=SystemInfo)
-    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+    # FIX: Added Extras container
+    extra: Extras = field(default_factory=Extras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False, compare=False)
 
     def __post_init__(self):
-        # Optim: No local mode/strict needed here as it delegates
-        mode = as_parse_mode(self._mode)
-        self.stage_system = maybe_from_dict(StageSystemSettings, self.stage_system, mode=mode) or StageSystemSettings(_mode=mode)
-        self.beam_system = maybe_from_dict(BeamSystemSettings, self.beam_system, mode=mode) or BeamSystemSettings(_mode=mode)
-        self.detector_system = maybe_from_dict(DetectorSystemSettings, self.detector_system, mode=mode) or DetectorSystemSettings(_mode=mode)
+        mode, strict, self.extra = _setup_init(self, self._mode, "SystemSettings")
+
+        self.stage_system = maybe_from_dict(StageSystemSettings, self.stage_system, mode=mode) or StageSystemSettings(
+            _mode=mode)
+        self.beam_system = maybe_from_dict(BeamSystemSettings, self.beam_system, mode=mode) or BeamSystemSettings(
+            _mode=mode)
+        self.detector_system = maybe_from_dict(DetectorSystemSettings, self.detector_system,
+                                               mode=mode) or DetectorSystemSettings(_mode=mode)
         self.info = maybe_from_dict(SystemInfo, self.info, mode=mode) or SystemInfo(_mode=mode)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        mode = as_parse_mode(self._mode if mode is None else mode)
+        mode, strict = _setup_validate(self._mode, mode)
         return (self.stage_system.validate(mode=mode) and
                 self.beam_system.validate(mode=mode) and
                 self.detector_system.validate(mode=mode) and
                 self.info.validate(mode=mode))
 
     def to_dict(self) -> dict:
-        return _jsonable({
+        d = {
             "stage_system": self.stage_system.to_dict(),
             "beam_system": self.beam_system.to_dict(),
             "detector_system": self.detector_system.to_dict(),
             "info": self.info.to_dict(),
-        })
+        }
+        # FIX: Include extras
+        return _finish_to_dict(d, self.extra)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "SystemSettings":
         mode = as_parse_mode(mode)
         if isinstance(d, SystemSettings): return replace(d, _mode=mode)
         if not isinstance(d, dict): return SystemSettings(_mode=mode)
+
+        # FIX: Collect extras
+        known = {"stage_system", "stage", "beam_system", "beam", "detector_system", "detector", "info", "extra"}
+        extra = collect_extra(d, known, owner="SystemSettings")
+
         return SystemSettings(
             stage_system=d.get("stage_system", d.get("stage")),
             beam_system=d.get("beam_system", d.get("beam")),
             detector_system=d.get("detector_system", d.get("detector")),
             info=d.get("info"),
-            _mode=mode,
+            extra=extra, _mode=mode,
         )
 
 @dataclass
@@ -2965,33 +3056,235 @@ class MicroscopeSettings:
     system: SystemSettings = field(default_factory=SystemSettings)
     image: ImageOutputSettings = field(default_factory=ImageOutputSettings)
     protocol: dict = field(default_factory=lambda: {"name": "demo"})
-    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+    # FIX: Added Extras container
+    extra: Extras = field(default_factory=Extras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False, compare=False)
 
     def __post_init__(self):
-        mode = as_parse_mode(self._mode)
+        mode, strict, self.extra = _setup_init(self, self._mode, "MicroscopeSettings")
+
         self.system = maybe_from_dict(SystemSettings, self.system, mode=mode) or SystemSettings(_mode=mode)
         self.image = maybe_from_dict(ImageOutputSettings, self.image, mode=mode) or ImageOutputSettings(_mode=mode)
         if not isinstance(self.protocol, dict): self.protocol = {"name": "demo"}
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        mode = as_parse_mode(self._mode if mode is None else mode)
+        mode, strict = _setup_validate(self._mode, mode)
         return self.system.validate(mode=mode) and self.image.validate(mode=mode)
 
     def to_dict(self) -> dict:
-        return _jsonable({
+        d = {
             "system": self.system.to_dict(),
             "image": self.image.to_dict(),
             "protocol": self.protocol,
-        })
+        }
+        # FIX: Include extras
+        return _finish_to_dict(d, self.extra)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "MicroscopeSettings":
         mode = as_parse_mode(mode)
         if isinstance(d, MicroscopeSettings): return replace(d, _mode=mode)
         if not isinstance(d, dict): return MicroscopeSettings(_mode=mode)
+
+        # FIX: Collect extras
+        known = {"system", "image", "protocol", "extra"}
+        extra = collect_extra(d, known, owner="MicroscopeSettings")
+
         return MicroscopeSettings(
             system=d.get("system"),
             image=d.get("image"),
             protocol=d.get("protocol", {"name": "demo"}),
-            _mode=mode,
+            extra=extra, _mode=mode,
+        )
+
+# =============================================================================
+# Requests
+# =============================================================================
+
+@dataclass
+class AcquisitionRequest:
+    """
+    An executable command to acquire an image.
+
+    A control-plane object that combines detector settings with output preferences.
+
+    Attributes:
+        detector_id: The ID of the detector to use (Required).
+        detector: Specific settings for this acquisition.
+        image: Output settings (format, path).
+
+    Notes:
+        In `STRICT` mode, this object requires a valid `detector_id` to be instantiated.
+        It enforces consistency between the outer `detector_id` and the inner `detector.detector_id`.
+    """
+    detector_id: Optional[str] = None
+    detector: DetectorSettings = field(default_factory=DetectorSettings)
+    image: ImageOutputSettings = field(default_factory=ImageOutputSettings)
+    extra: Extras = field(default_factory=Extras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+
+    def __post_init__(self):
+        # NORMALIZATION:
+        # 1. Structure Coercion (Dict -> Dataclass)
+        # 2. Patch missing holes (Copy IDs if one is missing)
+        mode, strict, self.extra = _setup_init(self, self._mode, "AcquisitionRequest")
+
+        self.detector = maybe_from_dict(DetectorSettings, self.detector, mode=mode) or DetectorSettings(_mode=mode)
+        self.image = maybe_from_dict(ImageOutputSettings, self.image, mode=mode) or ImageOutputSettings(_mode=mode)
+        self.detector_id = parse_optional_id_like(self.detector_id, name="id", strict=strict, extra=self.extra)
+
+        # Logic: Patching holes.
+        # DO NOT overwrite if both exist. That hides conflicts.
+        if self.detector_id is None and self.detector.detector_id is not None:
+            self.detector_id = self.detector.detector_id
+        elif self.detector.detector_id is None and self.detector_id is not None:
+            self.detector.detector_id = self.detector_id
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        # VALIDATION: Consistency & Readiness
+        mode, strict = _setup_validate(self._mode, mode)
+        ok = True
+
+        # Rule 1: Must have an ID to execute
+        if not self.detector_id:
+            note_or_raise(self.extra, "AcquisitionRequest.detector_id", ValueError("detector_id is required"), mode=mode)
+            ok = False
+
+        # Rule 2: Sub-objects must be valid
+        ok = self.detector.validate(mode=mode) and ok
+        ok = self.image.validate(mode=mode) and ok
+
+        # Rule 3: Cross-field consistency (The Conflict Case)
+        if self.detector.detector_id and self.detector_id and self.detector.detector_id != self.detector_id:
+            note_or_raise(self.extra, "AcquisitionRequest.id_mismatch", ValueError(
+                f"Ambiguous detector IDs: outer={self.detector_id}, inner={self.detector.detector_id}"), mode=mode)
+            if strict:
+                ok = False
+            else:
+                self.detector.detector_id = self.detector_id
+
+        return ok
+
+    def to_dict(self) -> dict:
+        d = {
+            "detector_id": self.detector_id,
+            "detector": self.detector.to_dict(),
+            "image": self.image.to_dict(),
+        }
+        return _finish_to_dict(d, self.extra)
+
+    @staticmethod
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "AcquisitionRequest":
+        mode = as_parse_mode(mode)
+        if isinstance(d, AcquisitionRequest): return replace(d, _mode=mode)
+        if not isinstance(d, dict): return AcquisitionRequest(_mode=mode)
+        extra = collect_extra(d, ("detector_id", "detector", "image", "extra"), owner="AcquisitionRequest")
+        return AcquisitionRequest(
+            detector_id=d.get("detector_id"),
+            detector=d.get("detector"),
+            image=d.get("image"),
+            extra=extra, _mode=mode
+        )
+
+@dataclass
+class StageMoveRequest:
+    """
+    Explicit intent to move the microscope stage.
+
+    Attributes:
+        target: The coordinate goals (absolute or relative vectors).
+        relative: If True, target values are added to current position (deltas).
+        backlash_correction: Whether to perform hardware backlash compensation.
+        wait_for_settle: If True, blocks until movement and settling are complete.
+        settle_time: Optional duration to wait after movement stops.
+                     If None, uses the default from StageSystemSettings.
+    """
+    target: StagePosition = field(default_factory=StagePosition)
+    relative: bool = False
+    backlash_correction: bool = True
+    wait_for_settle: bool = True
+    settle_time: Optional["Quantity"] = None
+    extra: Extras = field(default_factory=Extras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+
+    def __post_init__(self):
+        mode, strict, self.extra = _setup_init(self, self._mode, "StageMoveRequest")
+
+        self.target = maybe_from_dict(StagePosition, self.target, mode=mode) or StagePosition(_mode=mode)
+        self.relative = parse_bool_like(self.relative, default=False)
+        self.backlash_correction = parse_bool_like(self.backlash_correction, default=True)
+        self.wait_for_settle = parse_bool_like(self.wait_for_settle, default=True)
+
+        # 1. Capture the raw input (could be "500ms", float, or None)
+        raw_time = self.settle_time
+
+        # 2. Attempt to coerce it to a Quantity
+        self.settle_time = ensure_quantity(raw_time, "seconds")
+
+        # 3. Check if coercion failed (i.e. we had input, but now we have None)
+        if raw_time is not None and self.settle_time is None:
+            note_or_raise(
+                self.extra,
+                "StageMoveRequest.settle_time",
+                ValueError(f"Invalid time format: {raw_time!r}"),
+                mode=mode,
+                raw=raw_time
+            )
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        mode, strict = _setup_validate(self._mode, mode)
+        ok = True
+
+        if not self.target.validate(mode=mode):
+            ok = False
+
+        # Check for empty request
+        axes = [self.target.x, self.target.y, self.target.z,
+                self.target.r, self.target.tilt_x, self.target.tilt_y]
+        if all(a is None for a in axes):
+            note_or_raise(self.extra, "StageMoveRequest.empty",
+                          ValueError("StageMoveRequest has no target coordinates"),
+                          mode=mode)
+            if strict: ok = False
+
+        # Check for negative time
+        if self.settle_time is not None and self.settle_time.magnitude < 0:
+            note_or_raise(self.extra, "StageMoveRequest.settle_time",
+                          ValueError("Settle time cannot be negative"), mode=mode)
+            if strict:
+                ok = False
+            else:
+                self.settle_time = None  # Heal
+
+        return ok
+
+    def to_dict(self) -> dict:
+        d = {
+            "target": self.target.to_dict(),
+            "relative": self.relative,
+            "backlash_correction": self.backlash_correction,
+            "wait_for_settle": self.wait_for_settle,
+            "settle_time_s": serialize_quantity(self.settle_time, "seconds"),
+        }
+        return _finish_to_dict(d, self.extra)
+
+    @staticmethod
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "StageMoveRequest":
+        mode = as_parse_mode(mode)
+        if isinstance(d, StageMoveRequest): return replace(d, _mode=mode)
+        if not isinstance(d, dict): return StageMoveRequest(_mode=mode)
+
+        known = {"target", "relative", "backlash_correction", "wait_for_settle",
+                 "settle_time", "settle_time_s", "extra"}
+        extra = collect_extra(d, known, owner="StageMoveRequest")
+
+        # Just pass the raw value to the constructor; __post_init__ handles the rest.
+        return StageMoveRequest(
+            target=d.get("target"),
+            relative=d.get("relative", False),
+            backlash_correction=d.get("backlash_correction", True),
+            wait_for_settle=d.get("wait_for_settle", True),
+            settle_time=d.get("settle_time", d.get("settle_time_s")),
+            extra=extra,
+            _mode=mode
         )

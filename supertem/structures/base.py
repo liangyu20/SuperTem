@@ -1,8 +1,8 @@
 """
-supertem.structure.base
+supertem.structures.base
 
 Dataclass-based structures for TEM automation, covering:
-  - settings (beam / detector / stage / acquisition outputs)
+  - settings (beam / projection / detector / stage / acquisition outputs)
   - microscope state snapshots
   - image metadata containers
   - executable requests (control-plane objects)
@@ -293,6 +293,134 @@ VII. Implementation Conventions & Usage
        is correctly parsed into a Quantity object.
 
 ===============================================================================
+VIII. The Request Pattern (Control Plane Intents)
+===============================================================================
+
+While `Settings` objects define "Configuration" (static parameters) and `State`
+objects define "Snapshot" (telemetry), `Request` objects define "Intent."
+
+They are the vehicles for the Control Plane. A Request encapsulates a user's
+command to change the microscope's state.
+
+1. Anatomy of a Request
+-------------------------------------------------------------------------------
+   A Request typically consists of three components:
+   A. Target Identity (Mandatory)
+      - "Which hardware device?" (e.g., `detector_id`, `aperture_id`).
+      - Unlike Settings objects (which can be generic/reusable presets), Requests
+        MUST bind to a specific physical device before execution.
+
+   B. The Payload (The "What")
+      - Usually reuses a Domain Object (e.g., `StagePosition`, `DetectorSettings`).
+      - Fields are `Optional`. A value of `None` means "Do not change."
+      - This allows for precise partial updates (e.g., "Change only Exposure").
+
+   C. Modifiers (The "How")
+      - Execution flags that don't fit in the domain object.
+      - Examples: `relative=True`, `wait_for_settle=True`, `force=False`.
+
+2. The Usage Contract
+-------------------------------------------------------------------------------
+   A. Construct Strict by Default
+      Requests are code-driven commands. They default to `ParseMode.STRICT` because
+      ambiguity in a command is dangerous.
+
+   B. Validate Before Sending
+      A Request is invalid until `validate()` returns True.
+      - It must have a Target ID.
+      - It must have a non-empty Payload (no-op requests are rejected).
+      - It must satisfy cross-field logic (e.g. relative moves need coordinates).
+
+   C. Ephemeral Lifecycle
+      Requests are transient. They are created, validated, executed by the
+      Manager/Driver, and then discarded. They are rarely stored long-term.
+
+3. How to Write a New Request
+-------------------------------------------------------------------------------
+   1. Define the class with `_mode: ParseMode = ParseMode.STRICT`.
+   2. Include the ID field (e.g. `beam_id`) and validate its presence.
+   3. Include a `payload` or specific fields (use Category D: default=None).
+   4. Implement `validate()` to ensure the intent is executable.
+
+   Example:
+     req = StageMoveRequest(target=StagePosition(x=Q_(10, 'um')), relative=True)
+     if req.validate():
+         microscope.stage.move(req)
+
+===============================================================================
+IX. Architecture Overview (The "Noun-Verb" Topology)
+===============================================================================
+
+The module implements a strict Command-Query Separation (CQS) architecture.
+Interaction is divided into "Nouns" (Data/State) and "Verbs" (Intents/Requests).
+
+1. The Data Plane (Nouns)
+   - State Objects: Telemetry snapshots (e.g. `MicroscopeState`, `BeamState`).
+   - Settings Objects: Configuration payloads (e.g. `BeamSettings`, `ProjectionSettings`).
+   - System Settings: Hardware capabilities & limits (e.g. `StageSystemSettings`).
+
+2. The Control Plane (Verbs)
+   - Request Objects: Executable commands that wrap Settings with an intent.
+   - Naming Convention: `*ControlRequest` for hardware state management,
+     `*MoveRequest` for coordinate navigation, and `AcquisitionRequest` for data.
+
+3. Component Map
+   -----------------------------------------------------------------------------
+   Subsystem             | Configuration (Noun)   | Execution (Verb)
+   -----------------------------------------------------------------------------
+   Stage (Motion)        | StagePosition          | StageMoveRequest (Nav)
+                         |                        | StageControlRequest (Stop)
+   -----------------------------------------------------------------------------
+   Beam (Illumination)   | BeamSettings           | BeamControlRequest
+   (Gun/Condenser)       |                        |
+   -----------------------------------------------------------------------------
+   Projection (Imaging)  | ProjectionSettings     | ProjectionControlRequest
+   (Obj/Projector)       |                        |
+   -----------------------------------------------------------------------------
+   Scan (STEM)           | ScanSettings           | ScanControlRequest
+   -----------------------------------------------------------------------------
+   Detector              | DetectorSettings       | AcquisitionRequest (Capture)
+                         |                        | DetectorControlRequest (Mech)
+   -----------------------------------------------------------------------------
+   Vacuum                | VacuumSettings         | VacuumControlRequest
+   -----------------------------------------------------------------------------
+   Aperture              | Aperture               | ApertureControlRequest
+   -----------------------------------------------------------------------------
+
+===============================================================================
+X. Data Organization (The Hierarchy)
+===============================================================================
+
+The data plane is organized into two primary trees: Configuration (Static/Limits)
+and Telemetry (Dynamic/Snapshot).
+
+1. Configuration Tree (`MicroscopeSettings`)
+   Defines how the machine *should* behave and what it is *capable* of.
+
+   MicroscopeSettings
+   ├── system: SystemSettings
+   │   ├── stage_system: StageSystemSettings (Travel limits, Max speeds)
+   │   ├── beam_system: BeamSystemSettings (Voltage limits, Safety checks)
+   │   ├── projection_system: ProjectionSystemSettings (Mag ranges, Cam lengths)
+   │   ├── scan_system: ScanSystemSettings (Dwell time limits, Scan modes)
+   │   ├── detector_system: DetectorSystemSettings (Registry of cameras)
+   │   └── info: SystemInfo (Static hardware IDs, IP addresses)
+   ├── image: ImageOutputSettings (File formats, Save paths)
+   └── protocol: Dict (User-defined automation scripts)
+
+2. Telemetry Tree (`MicroscopeState`)
+   Defines what the machine is *currently doing*. Used for logs and metadata.
+
+   MicroscopeState
+   ├── stage_position: StagePosition (x, y, z, tilt)
+   ├── beam: BeamState (Voltage, current, spot size)
+   ├── projection: ProjectionSettings (Defocus, magnification, optical mode)
+   ├── scan: ScanSettings (Active dwell time, grid resolution)
+   ├── vacuum: VacuumSettings (Valve states, pressures)
+   ├── apertures: Dict[str, Aperture] (State of all inserted apertures)
+   └── detectors: Dict[str, DetectorState] (State of all active cameras)
+
+===============================================================================
 Rationale
 ===============================================================================
 
@@ -366,6 +494,13 @@ class ParseMode(str, Enum):
     STRICT = "strict"  # Raise errors immediately (Control Plane / Execution)
     LENIENT = "lenient"  # Log errors to Extras and continue (Data Plane / Logging)
 
+class StageDriveType(str, Enum):
+    """Defines the mechanism used for stage movement."""
+    DEFAULT = "default"  # Logic decided by driver (usually mechanical for large, piezo for small)
+    MECHANICAL = "mechanical"  # Coarse, large range, backlash prone
+    PIEZO = "piezo"  # Fine, small range, hysteresis free
+    HYBRID = "hybrid"  # Combined movement
+
 class Units:
     """Centralized definition of physical units."""
     NM = "nm"
@@ -374,9 +509,12 @@ class Units:
     KV = "kV"
     NA = "nA"
     MRAD = "mrad"
-    DEG = "deg"      # Pint alias for 'degree'
-    MS = "ms"        # Pint alias for 'millisecond'
+    DEG = "deg"
+    MS = "ms"
+    US = "us"
     SEC = "s"
+    PA = "Pa"
+    HZ = "Hz"
 
 def as_parse_mode(mode: Union["ParseMode", str, None]) -> "ParseMode":
     if isinstance(mode, ParseMode): return mode
@@ -420,7 +558,21 @@ class Extras:
 
     def to_dict(self) -> Dict[str, Any]:
         """Return a JSON-safe payload representation."""
-        return _jsonable({k: deepcopy(v) for k, v in self.__dict__.items() if v})
+
+        # We define EXACTLY what to keep
+        def _keep(val: Any) -> bool:
+            # 1. Always toss None
+            if val is None: return False
+
+            # 2. Toss empty collections (dict, list, string)
+            if isinstance(val, (dict, list, tuple, str)) and len(val) == 0:
+                return False
+
+            # 3. Keep everything else! (Numbers, Booleans, Objects)
+            return True
+
+        # Now 0 and False will survive because they are not None and not collections
+        return _jsonable({k: deepcopy(v) for k, v in self.__dict__.items() if _keep(v)})
 
     @staticmethod
     def from_any(value: Any, *, owner: str = "unknown") -> "Extras":
@@ -546,7 +698,7 @@ def ensure_quantity(value: Any, unit: str) -> Optional["Quantity"]:
     if isinstance(value, dict):
         mag = value.get("magnitude", value.get("value"))
         u = value.get("unit", value.get("units"))
-        if mag is None: return None  # Or raise ValueError("Dict missing magnitude")
+        if mag is None: raise ValueError(f"Quantity dict missing 'magnitude': {value}")
         return Q_(mag, u or unit).to(unit)
 
     if isinstance(value, str):
@@ -563,16 +715,14 @@ def ensure_quantity(value: Any, unit: str) -> Optional["Quantity"]:
     return Q_(float(value), unit).to(unit)
 
 def serialize_quantity(q: Optional["Quantity"], target_unit: str) -> Optional[float]:
-    """Convert a Quantity to a plain float magnitude in the target unit.
+    """Convert a Quantity to a plain float magnitude in the target unit. Raises Exception on unit mismatch.
 
     This strips the unit information for safe JSON serialization.
     Example: serialize_quantity(Q_(300, 'kV'), 'V') -> 300000.0
     """
     if q is None: return None
-    try:
-        if not isinstance(q, Quantity): return float(q)
-        return float(q.to(target_unit).magnitude)
-    except Exception: return None
+    if not isinstance(q, Quantity): return float(q)
+    return float(q.to(target_unit).magnitude)  # Let pint errors bubble up
 
 def _check_data_format(data: np.ndarray) -> bool:
     """Validate if numpy array is a valid 2D image (uint8/uint16)."""
@@ -589,8 +739,8 @@ def add_extra_if_any(out: Dict[str, Any], extra: Any) -> Dict[str, Any]:
     ex_obj = extra if isinstance(extra, Extras) else Extras.from_any(extra)
     if ex_obj.is_empty(): return out
     payload = ex_obj.to_dict()
-    clean_payload = {k: v for k, v in payload.items() if v}
-    if clean_payload: out["extra"] = clean_payload
+    if payload:
+        out["extra"] = payload
     return out
 
 def _finish_to_dict(payload: Dict[str, Any], extra: Any) -> Dict[str, Any]:
@@ -666,7 +816,7 @@ class FieldParser:
         if exc:
             note_or_raise(self.extra, self._key(name), exc, mode=self.mode, raw=value)
         elif self.extra is not None:
-            _extra_put_raw(self.extra, name, value)
+            _extra_put_raw(self.extra, self._key(name), value)
 
     # --- Primitives ---
 
@@ -747,7 +897,7 @@ class FieldParser:
             self._record(name, val, TypeError(f"{name} must be str"))
             return default
         if isinstance(val, bool):
-            self._record(name, val)
+            self._record(name, val, TypeError(f"{name} cannot be bool"))
             return default
         try:
             s = str(val).strip()
@@ -760,6 +910,8 @@ class FieldParser:
         """Parses identifier. Logs specific error for empty strings."""
         if val is None: return None
         if isinstance(val, str) and not val.strip():
+            if self.strict:
+                raise ValueError(f"Field '{name}' cannot be an empty string")
             self._record(name, val)
             if hasattr(self.extra, "notes"):
                 self.extra.notes.setdefault(f"{self._key(name)}.empty", []).append({
@@ -875,7 +1027,10 @@ class FieldParser:
     def map_model(self, cls: Type[T], val: Any, name: str, id_field: Optional[str] = None) -> Dict[str, T]:
         """Parses {key: Object} map."""
         out: Dict[str, T] = {}
-        if not val or not isinstance(val, dict): return out
+        if val is None: return out
+        if not isinstance(val, dict):
+            self._record(name, val, TypeError(f"{name} must be dict, got {type(val).__name__}"))
+            return out
         for k, v in val.items():
             key_norm = self.id(k, f"{name}.key")
             if key_norm is None: continue
@@ -929,19 +1084,27 @@ class Validator:
         # Prepare Exception
         e = exc if isinstance(exc, Exception) else ValueError(str(exc))
 
-        # Log or Raise
+        # 1. STRICT: Raise immediately (Fail Fast)
+        if self.strict:
+            self.valid = False  # Optional, but good for state hygiene before crashing
+            raise e
+
+        # 2. LENIENT: Log and Continue
         note_or_raise(self.extra, self._key(key_suffix), e, mode=self.mode, raw=raw)
 
-        if self.strict:
-            self.valid = False
-            return False
-
-        # Heal (Lenient only)
+        # Heal
         if heal:
             try:
                 heal()
+                # If heal succeeds, we consider the object "repaired" (validity preserved)
+                return True
             except Exception:
-                pass
+                # If healing crashes, the object is definitely broken
+                self.valid = False
+        else:
+            # If there is no way to heal the violation, the object remains invalid
+            self.valid = False
+
         return False
 
     # --- Common specialized checks ---
@@ -950,16 +1113,18 @@ class Validator:
         """Validates a child object if it exists."""
         if child and hasattr(child, 'validate'):
             if not child.validate(mode=self.mode):
-                if self.strict: self.valid = False
+                self.valid = False
                 return False
         return True
 
     def check_nested_map(self, children: Dict[str, Any]) -> bool:
         """Validates a dictionary of child objects."""
         if not children: return True
+        all_valid = True
         for child in children.values():
-            self.check_nested(child)
-        return self.valid
+            if not self.check_nested(child):
+                all_valid = False
+        return all_valid
 
     def check_gt_zero(self, val: Any, name: str, unit_aware: bool = False,
                       reset_to: Any = None) -> bool:
@@ -1004,6 +1169,8 @@ def _auto_to_dict(obj: Any, unit_map: Dict[str, str] = None, key_map: Dict[str, 
     if unit_map is None: unit_map = {}
     if key_map is None: key_map = {}
 
+    is_strict_mode = hasattr(obj, "_mode") and is_strict(obj._mode)
+
     out = {}
 
     # Iterate over all fields defined in the dataclass
@@ -1011,43 +1178,58 @@ def _auto_to_dict(obj: Any, unit_map: Dict[str, str] = None, key_map: Dict[str, 
         name = field.name
         val = getattr(obj, name)
 
-        # Skip internals and None values
         if name.startswith("_") or name == "extra" or val is None:
             continue
 
-        # Determine Output Key
-        key = name
+        key = key_map.get(name, name)
         target_unit = unit_map.get(name)
 
-        if name in key_map:
-            key = key_map[name]
-        elif target_unit:
-            # Default convention: append unit suffix
-            key = f"{name}_{target_unit}"
-
-        # Serialize Value
+        # 1. Happy Path: Field is in _UNITS
         if target_unit:
-            # Handle List of Quantities vs Scalar Quantity
-            if isinstance(val, (list, tuple)):
-                out[key] = [serialize_quantity(v, target_unit) for v in val]
-            else:
-                out[key] = serialize_quantity(val, target_unit)
+            key = f"{key}_{target_unit}" if name not in key_map else key
+            try:
+                # Try strict conversion
+                if isinstance(val, (list, tuple)):
+                    out[key] = [serialize_quantity(v, target_unit) for v in val]
+                else:
+                    out[key] = serialize_quantity(val, target_unit)
+            except Exception as e:
+                # CONVERSION FAILED
+                if is_strict_mode:
+                    raise ValueError(f"Serialization failed for {name}: {e}")
 
+                # Lenient Fallback: Keep original structure + Warning
+                out[key] = _jsonable(val)  # Dump as {magnitude: x, unit: y}
+                if hasattr(obj, "extra") and isinstance(obj.extra, Extras):
+                    obj.extra.notes.setdefault("serialization_errors", []).append(
+                        f"Field '{name}' failed conversion to {target_unit}: {e}"
+                    )
+
+        # 2. The Guard: Field is a Quantity BUT MISSING from _UNITS
+        elif isinstance(val, Quantity):
+            msg = f"Serialization Error: Field '{obj.__class__.__name__}.{name}' is a Quantity but is missing from _UNITS."
+
+            if is_strict_mode:
+                # Ruthless: Crash the control plane
+                raise ValueError(msg)
+            else:
+                # Lenient: Record the shame, save as object, and continue
+                if hasattr(obj, "extra") and isinstance(obj.extra, Extras):
+                    obj.extra.notes.setdefault("serialization_warnings", []).append(msg)
+
+                # Fallback to {magnitude: x, unit: y}
+                out[key] = _jsonable(val)
+
+        # 3. Standard Recursion
         elif hasattr(val, "to_dict"):
             out[key] = val.to_dict()
-
         elif isinstance(val, (list, tuple)):
-            # Recurse on list items
             out[key] = [v.to_dict() if hasattr(v, "to_dict") else _jsonable(v) for v in val]
-
         elif isinstance(val, dict):
-            # Recurse on dict values
             out[key] = {k: (v.to_dict() if hasattr(v, "to_dict") else _jsonable(v)) for k, v in val.items()}
-
         else:
             out[key] = _jsonable(val)
 
-    # Inject Extras
     return _finish_to_dict(out, getattr(obj, "extra", None))
 
 def _auto_from_dict(
@@ -1120,19 +1302,27 @@ def _auto_from_dict(
 @dataclass
 class Point:
     """
-    Simple 3D point used for geometry and settings.
+    Simple 3D point used for geometry and alignments.
 
     Role:     Structure
     Context:  Both (Data-plane / Control-plane)
     Category: A (Config)
 
-    Note:
-    - This class is lightweight and does not include the `Extras` container.
+    Attributes:
+        x (Optional[float]): X coordinate.
+            None Behavior: Defaulted to 0.0.
+        y (Optional[float]): Y coordinate.
+            None Behavior: Defaulted to 0.0.
+        z (Optional[float]): Z coordinate.
+            None Behavior: Defaulted to 0.0.
+        name (Optional[str]): Label for this point.
+            None Behavior: Preserved as None.
     """
     x: Optional[float] = None
     y: Optional[float] = None
     z: Optional[float] = None
     name: Optional[str] = None
+    extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.LENIENT, repr=False)
 
     def __post_init__(self):
@@ -1190,11 +1380,11 @@ class ROI:
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
-        v.check(self.x >= 0, "xy", "ROI.x must be >= 0", raw=self.x, heal=lambda: setattr(self, 'x', 0))
-        v.check(self.y >= 0, "xy", "ROI.y must be >= 0", raw=self.y, heal=lambda: setattr(self, 'y', 0))
-        v.check(self.width > 0, "size", "ROI.width must be > 0", raw=self.width,
+        v.check(self.x >= 0, "x", "ROI.x must be >= 0", raw=self.x, heal=lambda: setattr(self, 'x', 0))
+        v.check(self.y >= 0, "y", "ROI.y must be >= 0", raw=self.y, heal=lambda: setattr(self, 'y', 0))
+        v.check(self.width > 0, "width", "ROI.width must be > 0", raw=self.width,
                 heal=lambda: setattr(self, 'width', 512))
-        v.check(self.height > 0, "size", "ROI.height must be > 0", raw=self.height,
+        v.check(self.height > 0, "height", "ROI.height must be > 0", raw=self.height,
                 heal=lambda: setattr(self, 'height', 512))
         return v.valid
 
@@ -1222,10 +1412,25 @@ class StagePosition:
     Category: C / D (Measured State / Intent)
 
     Attributes:
+        name (Optional[str]): Label for this position (e.g. "Sample Center").
+            None Behavior: Preserved as None.
         x, y, z (Optional[Quantity]): Translation coordinates. Units: nm.
             None Behavior: Snapshot (Unknown) | Intent (No Change/Wildcard).
-        tilt_x, tilt_y (Optional[Quantity]): Rotation/Alpha-Beta tilts. Units: degree.
+        r (Optional[Quantity]): Rotation coordinate. Units: deg.
             None Behavior: Snapshot (Unknown) | Intent (No Change/Wildcard).
+        tilt_x, tilt_y (Optional[Quantity]): Alpha/Beta tilts. Units: deg.
+            None Behavior: Snapshot (Unknown) | Intent (No Change/Wildcard).
+        coordinate_system (Optional[str]): Reference frame ID.
+            None Behavior: Preserved as None.
+
+    Behavior:
+        1. Snapshot (Telemetry): Represents the physical location of the stage.
+           Fields capable of being read are populated; others are None.
+        2. Intent (Movement): Represents a target or a delta.
+           - Absolute Move: Fields set to None are ignored (axes do not move).
+           - Relative Move: Fields set to None imply 0 delta.
+        3. Arithmetic: Supports vector math (pos_a + pos_b, target - current).
+           Math operations propagate None (None + 10 = None).
     """
     name: Optional[str] = None
     x: Optional["Quantity"] = None
@@ -1330,12 +1535,24 @@ class StageSystemSettings:
     Attributes:
         enabled (Optional[bool]): Master toggle for stage interaction.
             None Behavior: Defaulted to True.
-        max_step_distance (Optional[Quantity]): Safety cap for XY travel. Units: nm.
-            None Behavior: Defaulted to 50,000 nm.
-        settle_time (Optional[Quantity]): Time to wait for vibration damping. Units: seconds.
-            None Behavior: Defaulted to 0.2 seconds.
+        can_x, can_y, can_z (Optional[bool]): Individual axis toggles.
+            None Behavior: Defaulted to True.
+        can_r, can_tilt_x, can_tilt_y (Optional[bool]): Individual axis toggles.
+            None Behavior: Defaulted to False.
         x_limits, y_limits, z_limits (Optional[Tuple[Quantity, Quantity]]): Physical travel bounds.
-            None Behavior: Preserved as None (implies 'Unlimited').
+            None Behavior: Preserved as None (Axis disabled).
+        r_limits, tilt_x_limits, tilt_y_limits (Optional[Tuple[Quantity, Quantity]]): Physical travel bounds.
+            None Behavior: Preserved as None (Axis disabled).
+        max_step_distance (Optional[Quantity]): Safety cap for XY/Z travel per move. Units: nm.
+            None Behavior: Defaulted to 50,000 nm.
+        max_step_deg (Optional[Quantity]): Safety cap for rotation per move. Units: deg.
+            None Behavior: Defaulted to 1.0 deg.
+        eucentric_z (Optional[Quantity]): Calibrated sample height. Units: nm.
+            None Behavior: Preserved as None.
+        settle_time (Optional[Quantity]): Time to wait for vibration damping. Units: s.
+            None Behavior: Defaulted to 0.2 s.
+        timeout (Optional[Quantity]): Max duration for move operations. Units: s.
+            None Behavior: Defaulted to 10.0 s.
     """
     enabled: Optional[bool] = None
     can_x: Optional[bool] = None
@@ -1351,7 +1568,7 @@ class StageSystemSettings:
     tilt_x_limits: Optional[Tuple["Quantity", "Quantity"]] = None
     tilt_y_limits: Optional[Tuple["Quantity", "Quantity"]] = None
     max_step_distance: Optional["Quantity"] = None
-    max_step_angle: Optional["Quantity"] = None
+    max_step_deg: Optional["Quantity"] = None
     eucentric_z: Optional["Quantity"] = None
     settle_time: Optional["Quantity"] = None
     timeout: Optional["Quantity"] = None
@@ -1361,13 +1578,13 @@ class StageSystemSettings:
     _UNITS = {
         "x_limits": Units.NM, "y_limits": Units.NM, "z_limits": Units.NM,
         "r_limits": Units.DEG, "tilt_x_limits": Units.DEG, "tilt_y_limits": Units.DEG,
-        "max_step_distance": Units.NM, "max_step_angle": Units.DEG,
+        "max_step_distance": Units.NM, "max_step_deg": Units.DEG,
         "eucentric_z": Units.NM, "settle_time": Units.SEC, "timeout": Units.SEC
     }
 
     _KEYS = {
         "max_step_distance": "max_step_nm",
-        "max_step_angle": "max_step_deg"
+        "max_step_deg": "max_step_deg"
     }
 
     def __post_init__(self):
@@ -1381,7 +1598,7 @@ class StageSystemSettings:
         self.can_tilt_x = p.bool(self.can_tilt_x, "can_tilt_x", default=False)
         self.can_tilt_y = p.bool(self.can_tilt_y, "can_tilt_y", default=False)
 
-        # Category C: Limits (Nullable - If None, it implies 'Unlimited')
+        # Category C: Limits (If None, axis will be disabled during validation)
         self.x_limits = p.pair_qty(self.x_limits, "x_limits", Units.NM)
         self.y_limits = p.pair_qty(self.y_limits, "y_limits", Units.NM)
         self.z_limits = p.pair_qty(self.z_limits, "z_limits", Units.NM)
@@ -1392,7 +1609,7 @@ class StageSystemSettings:
         # Category A: Apply Defaults (Safety Settings)
         self.max_step_distance = p.qty(self.max_step_distance, "max_step_distance", Units.NM,
                                        default=Q_(50000.0, Units.NM))
-        self.max_step_angle = p.qty(self.max_step_angle, "max_step_angle", Units.DEG, default=Q_(1.0, Units.DEG))
+        self.max_step_deg = p.qty(self.max_step_deg, "max_step_deg", Units.DEG, default=Q_(1.0, Units.DEG))
         self.eucentric_z = p.qty(self.eucentric_z, "eucentric_z", Units.NM)
         self.settle_time = p.qty(self.settle_time, "settle_time", Units.SEC, default=Q_(0.2, Units.SEC))
         self.timeout = p.qty(self.timeout, "timeout", Units.SEC, default=Q_(10.0, Units.SEC))
@@ -1434,14 +1651,30 @@ class StageSystemSettings:
         """
         RUNTIME CHECK: External Safety.
         Returns a SafetyCheck object (True/False + reasons) without modifying self.extra.
-        Args:
-                target: The desired position (absolute) or movement vector (relative).
-                current: The current stage position (required for relative checks or step size calc).
-                relative: If True, 'target' is treated as a delta to 'current'.
+
+        Checks:
+        1. Is the axis enabled? (can_x, can_tilt_x, etc.)
+        2. Is the destination within absolute limits? (x_limits, etc.)
+        3. Is the step size within dynamic limits? (max_step_distance, etc.)
         """
         reasons = []
 
-        # 1. Resolve Absolute Target
+        # --- 1. Validate Axis Availability (Intents vs Capabilities) ---
+        # If the user intends to move an axis (value is not None), that axis MUST be enabled.
+        axes_map = {
+            "x": self.can_x, "y": self.can_y, "z": self.can_z,
+            "r": self.can_r, "tilt_x": self.can_tilt_x, "tilt_y": self.can_tilt_y
+        }
+
+        for axis, is_enabled in axes_map.items():
+            if getattr(target, axis) is not None and not is_enabled:
+                reasons.append(f"Movement requested on disabled axis: '{axis}'")
+
+        # If we already failed basic capability checks, return early to avoid math errors
+        if reasons:
+            return SafetyCheck(allowed=False, reasons=reasons)
+
+        # --- 2. Resolve Absolute Target & Step Vector ---
         abs_target = target
         step_vector = None
 
@@ -1449,23 +1682,20 @@ class StageSystemSettings:
             if current is None:
                 return SafetyCheck.failure("Cannot perform relative move without current position")
 
-            # Check if we know where we are starting from
-            axes_to_check = [
-                ("x", target.x, current.x), ("y", target.y, current.y),
-                ("z", target.z, current.z), ("r", target.r, current.r),
-                ("tilt_x", target.tilt_x, current.tilt_x), ("tilt_y", target.tilt_y, current.tilt_y),
-            ]
-            for axis_name, delta, start_val in axes_to_check:
-                if delta is not None and start_val is None:
-                    return SafetyCheck.failure(
-                        f"Relative move on '{axis_name}' impossible: current position is unknown.")
+            # Check if we have a valid starting point for all requested deltas
+            for axis in ["x", "y", "z", "r", "tilt_x", "tilt_y"]:
+                if getattr(target, axis) is not None and getattr(current, axis) is None:
+                    return SafetyCheck.failure(f"Relative move on '{axis}' impossible: current position unknown.")
 
             abs_target = current + target
             step_vector = target
         else:
-            step_vector = (target - current) if current else None
+            # Absolute move
+            if current:
+                step_vector = target - current
+            # If current is None, we can still check absolute limits, but skip step checks
 
-        # 2. Check Static Limits (Boundaries)
+        # --- 3. Check Static Limits (Boundaries) ---
         def check_bound(val, lims, name):
             if val is not None and lims:
                 if not (lims[0] <= val <= lims[1]):
@@ -1478,20 +1708,36 @@ class StageSystemSettings:
         check_bound(abs_target.tilt_x, self.tilt_x_limits, "tilt_x")
         check_bound(abs_target.tilt_y, self.tilt_y_limits, "tilt_y")
 
-        # 3. Check Dynamic Limits (Step Size)
+        # --- 4. Check Dynamic Limits (Step Size) ---
         if step_vector is not None:
-            dx = step_vector.x or Q_(0, Units.NM)
-            dy = step_vector.y or Q_(0, Units.NM)
-            distance = (dx.to(Units.NM).magnitude ** 2 + dy.to(Units.NM).magnitude ** 2) ** 0.5
-            max_dist_nm = self.max_step_distance.to(Units.NM).magnitude
+            # XY Euclidian Distance
+            if step_vector.x is not None or step_vector.y is not None:
+                dx = step_vector.x if step_vector.x is not None else Q_(0, Units.NM)
+                dy = step_vector.y if step_vector.y is not None else Q_(0, Units.NM)
+                distance = (dx.to(Units.NM).magnitude ** 2 + dy.to(Units.NM).magnitude ** 2) ** 0.5
+                max_dist_nm = self.max_step_distance.to(Units.NM).magnitude
 
-            if distance > max_dist_nm:
-                reasons.append(f"XY step {distance:.1f}nm exceeds limit {max_dist_nm:.1f}nm")
+                if distance > max_dist_nm:
+                    reasons.append(f"XY step {distance:.1f}nm exceeds limit {max_dist_nm:.1f}nm")
 
+            # Z Step Limit
+            if step_vector.z is not None:
+                d_z = abs(step_vector.z.to(Units.NM).magnitude)
+                max_dist_nm = self.max_step_distance.to(Units.NM).magnitude
+
+                if d_z > max_dist_nm:
+                    reasons.append(f"Z step {d_z:.1f}nm exceeds limit {max_dist_nm:.1f}nm")
+
+            # Tilt Step Limits
             if step_vector.tilt_x is not None:
                 d_tilt = abs(step_vector.tilt_x)
-                if d_tilt > self.max_step_angle:
-                    reasons.append(f"Tilt X step {d_tilt} exceeds limit {self.max_step_angle}")
+                if d_tilt > self.max_step_deg:
+                    reasons.append(f"Tilt X step {d_tilt} exceeds limit {self.max_step_deg}")
+
+            if step_vector.tilt_y is not None:
+                d_tilt = abs(step_vector.tilt_y)
+                if d_tilt > self.max_step_deg:
+                    reasons.append(f"Tilt Y step {d_tilt} exceeds limit {self.max_step_deg}")
 
         return SafetyCheck(allowed=(len(reasons) == 0), reasons=reasons)
 
@@ -1503,68 +1749,80 @@ class StageSystemSettings:
         return _auto_from_dict(StageSystemSettings, d, mode, alias_map={
             "x_limits": "x_limits_nm", "y_limits": "y_limits_nm", "z_limits": "z_limits_nm",
             "r_limits": "r_limits_deg", "tilt_x_limits": "tilt_x_limits_deg", "tilt_y_limits": "tilt_y_limits_deg",
-            "max_step_distance": "max_step_nm", "max_step_angle": "max_step_deg",
+            "max_step_distance": "max_step_nm", "max_step_deg": "max_step_angle",
             "eucentric_z": "eucentric_z_nm", "settle_time": "settle_time_s", "timeout": "timeout_s"
         })
 
 @dataclass
 class BeamSettings:
     """
-    Optical parameters of the electron beam for both state reporting and control.
+    Optical parameters of the electron beam (Gun + Condensers).
 
-    Role:     Gatekeeper (System Limits)
-    Context:  Control-plane
-    Category: A / B (Config and Structure)
+    Role:     Dual-Use (Snapshot and Intent)
+    Context:  Both (Data-plane / Control-plane)
+    Category: C / D (Measured State / Intent)
 
     Attributes:
         voltage (Optional[Quantity]): Accelerating voltage. Units: kV.
             None Behavior: Snapshot (Unknown) | Intent (No Change).
-        spot_size (Optional[int]): Beam focus index.
+        beam_current (Optional[Quantity]): Measured current. Units: nA.
             None Behavior: Snapshot (Unknown) | Intent (No Change).
-        defocus (Optional[Quantity]): Lens shift from focus. Units: nm.
+        spot_size (Optional[int]): Beam focus/condenser index.
             None Behavior: Snapshot (Unknown) | Intent (No Change).
+        convergence_angle (Optional[Quantity]): Alpha angle. Units: mrad.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        beam_shift (Optional[Point]): Beam alignment shift.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        condenser_stigmation (Optional[Point]): Stigmator coil values.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        gun_tilt (Optional[Point]): Gun alignment tilt.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+
+    Behavior:
+        1. Snapshot (Telemetry): Represents the active state of the column.
+        2. Intent (Control): Represents a partial configuration change.
+           Example: BeamSettings(spot_size=3) will change ONLY the spot size,
+           leaving voltage and alignments untouched.
     """
     voltage: Optional["Quantity"] = None
     beam_current: Optional["Quantity"] = None
     spot_size: Optional[int] = None
     convergence_angle: Optional["Quantity"] = None
-    defocus: Optional["Quantity"] = None
-    stigmation: Optional[Point] = None
+
+    # Gun/Condenser alignments
     beam_shift: Optional[Point] = None
-    image_shift: Optional[Point] = None
-    scan_rotation: Optional["Quantity"] = None
+    condenser_stigmation: Optional[Point] = None  # Renamed from 'stigmation'
+    gun_tilt: Optional[Point] = None  # Added missing alignment
+
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     _UNITS = {
-        "voltage": Units.KV, "beam_current": Units.NA,
-        "convergence_angle": Units.MRAD, "defocus": Units.NM,
-        "scan_rotation": Units.DEG
+        "voltage": Units.KV,
+        "beam_current": Units.NA,
+        "convergence_angle": Units.MRAD
     }
 
     def __post_init__(self):
         p = FieldParser(self, self._mode, "BeamSettings")
-        self.spot_size = p.int(self.spot_size, "spot_size")
         self.voltage = p.qty(self.voltage, "voltage", Units.KV)
         self.beam_current = p.qty(self.beam_current, "beam_current", Units.NA)
+        self.spot_size = p.int(self.spot_size, "spot_size")
         self.convergence_angle = p.qty(self.convergence_angle, "convergence_angle", Units.MRAD)
-        self.defocus = p.qty(self.defocus, "defocus", Units.NM)
-        self.scan_rotation = p.qty(self.scan_rotation, "scan_rotation", Units.DEG)
 
-        self.stigmation = p.model(Point, self.stigmation, "stigmation", default=None)
-        self.beam_shift = p.model(Point, self.beam_shift, "beam_shift", default=None)
-        self.image_shift = p.model(Point, self.image_shift, "image_shift", default=None)
+        self.beam_shift = p.model(Point, self.beam_shift, "beam_shift")
+        self.condenser_stigmation = p.model(Point, self.condenser_stigmation, "condenser_stigmation")
+        self.gun_tilt = p.model(Point, self.gun_tilt, "gun_tilt")
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
-        v.check_nested(self.stigmation)
         v.check_nested(self.beam_shift)
-        v.check_nested(self.image_shift)
 
         v.check_ge_zero(self.convergence_angle, "convergence_angle", unit_aware=True, reset_to=None)
         v.check_ge_zero(self.voltage, "voltage", unit_aware=True, reset_to=None)
         v.check_ge_zero(self.beam_current, "beam_current", unit_aware=True, reset_to=None)
         v.check_ge_zero(self.spot_size, "spot_size", reset_to=None)
+
         return v.valid
 
     def to_dict(self) -> dict:
@@ -1574,8 +1832,7 @@ class BeamSettings:
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "BeamSettings":
         return _auto_from_dict(BeamSettings, d, mode, alias_map={
             "voltage": "voltage_kv", "beam_current": "beam_current_na",
-            "convergence_angle": "convergence_angle_mrad", "defocus": "defocus_nm",
-            "scan_rotation": "scan_rotation_deg"
+            "convergence_angle": "convergence_angle_mrad"
         })
 
 # Alias for semantic clarity in Read-Only contexts
@@ -1584,21 +1841,25 @@ BeamState = BeamSettings
 @dataclass
 class BeamSystemSettings:
     """
-    Safety limits and supported ranges for beam optics and high voltage.
+    Safety limits and capabilities for the Illumination system.
 
     Role:     Gatekeeper (System Limits)
     Context:  Control-plane
-    Category: A / B (Config and Structure)
+    Category: A (Strict Runtime Config)
 
     Attributes:
         enabled (Optional[bool]): Master toggle for beam control.
             None Behavior: Defaulted to True.
-        default_beam (Optional[BeamSettings]): Baseline settings for beam reset.
-            None Behavior: Structural Default (Empty BeamSettings).
+        default_beam (Optional[BeamSettings]): Baseline settings for reset.
+            None Behavior: Structural Default (Empty object).
         voltage_limits (Optional[Tuple[Quantity, Quantity]]): Min/Max HT. Units: kV.
-            None Behavior: Preserved as None (implies 'Unlimited').
+            None Behavior: Preserved as None (Unlimited).
+        beam_current_limits (Optional[Tuple[Quantity, Quantity]]): Min/Max Current. Units: nA.
+            None Behavior: Preserved as None (Unlimited).
         spot_size_limits (Optional[Tuple[int, int]]): Valid range for spot indices.
-            None Behavior: Preserved as None.
+            None Behavior: Preserved as None (Unlimited).
+        convergence_angle_limits (Optional[Tuple[Quantity, Quantity]]): Valid range. Units: mrad.
+            None Behavior: Preserved as None (Unlimited).
     """
     enabled: Optional[bool] = None
     default_beam: Optional[BeamSettings] = None
@@ -1606,12 +1867,14 @@ class BeamSystemSettings:
     beam_current_limits: Optional[Tuple["Quantity", "Quantity"]] = None
     spot_size_limits: Optional[Tuple[int, int]] = None
     convergence_angle_limits: Optional[Tuple["Quantity", "Quantity"]] = None
+
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     _UNITS = {
-        "voltage_limits": Units.KV, "beam_current_limits": Units.NA,
-        "convergence_angle_limits": Units.MRAD
+        "voltage_limits": Units.KV,
+        "beam_current_limits": Units.NA,
+        "convergence_angle_limits": Units.MRAD,
     }
 
     def __post_init__(self):
@@ -1688,21 +1951,233 @@ class BeamSystemSettings:
         })
 
 @dataclass
-class DetectorSettings:
+class ProjectionSettings:
     """
-    Detector parameters used for reporting state and requesting image acquisition.
+    Imaging system controls (Objective + Projectors).
 
     Role:     Dual-Use (Snapshot and Intent)
     Context:  Both (Data-plane / Control-plane)
     Category: C / D (Measured State / Intent)
 
     Attributes:
-        detector_id (Optional[str]): The identifier of the camera to use.
-            None Behavior: Required for routing; error in Strict mode.
+        optical_mode (Optional[str]): Active lens program (e.g. "IMAGING", "DIFFRACTION").
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        magnification_index (Optional[int]): Discrete step index for mag.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        defocus (Optional[Quantity]): Deviation from focus. Units: nm.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        camera_length (Optional[Quantity]): Effective camera length (Diffraction). Units: mm.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        objective_stigmation (Optional[Point]): Objective stigmator coils.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        image_shift (Optional[Point]): Image shift coils.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        diffraction_shift (Optional[Point]): Diffraction shift coils.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        screen_position (Optional[str]): Mechanical screen state ("UP", "DOWN").
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+
+    Behavior:
+        1. Snapshot (Telemetry): Represents the active imaging state.
+        2. Intent (Control): Represents a partial configuration change.
+           - Mode Switching: If `optical_mode` changes (e.g. to DIFFRACTION),
+             associated fields (e.g. `camera_length`) become mandatory.
+    """
+    optical_mode: Optional[str] = None  # "IMAGING", "DIFFRACTION", "LAD"
+
+    # Imaging Parameters (IMAGING mode)
+    magnification_index: Optional[int] = None
+    defocus: Optional["Quantity"] = None
+    objective_stigmation: Optional[Point] = None
+    image_shift: Optional[Point] = None
+
+    # Diffraction Parameters (DIFFRACTION mode)
+    camera_length: Optional["Quantity"] = None
+    diffraction_shift: Optional[Point] = None
+
+    screen_position: Optional[str] = None  # "UP", "DOWN"
+
+    extra: Extras = field(default_factory=Extras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+
+    _UNITS = {
+        "defocus": Units.NM,
+        "camera_length": Units.MM
+    }
+
+    def __post_init__(self):
+        p = FieldParser(self, self._mode, "ProjectionSettings")
+        self.optical_mode = p.str(self.optical_mode, "optical_mode")
+        self.magnification_index = p.int(self.magnification_index, "magnification_index")
+        self.defocus = p.qty(self.defocus, "defocus", Units.NM)
+        self.camera_length = p.qty(self.camera_length, "camera_length", Units.MM)
+        self.screen_position = p.str(self.screen_position, "screen_position")
+
+        self.objective_stigmation = p.model(Point, self.objective_stigmation, "objective_stigmation")
+        self.image_shift = p.model(Point, self.image_shift, "image_shift")
+        self.diffraction_shift = p.model(Point, self.diffraction_shift, "diffraction_shift")
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        v = Validator(self, mode)
+
+        v.check_nested(self.objective_stigmation)
+        v.check_nested(self.image_shift)
+
+        # --- NEW VALIDATION LOGIC ---
+        v.check_ge_zero(self.camera_length, "camera_length", unit_aware=True, reset_to=None)
+        v.check_ge_zero(self.magnification_index, "magnification_index", reset_to=None)
+
+        if self.screen_position:
+            v.check(self.screen_position in {"UP", "DOWN"}, "screen_position",
+                    "Must be UP or DOWN", heal=lambda: setattr(self, 'screen_position', None))
+
+        # Consistency Check: Mode vs Value
+        if self.optical_mode == "DIFFRACTION" and self.camera_length is None:
+            # In strict mode, if you switch to diffraction, you must know the length
+            v.check(False, "missing_cam_len", "Diffraction mode requires camera_length")
+
+        return v.valid
+
+    def to_dict(self) -> dict:
+        return _auto_to_dict(self, unit_map=self._UNITS)
+
+    @staticmethod
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "ProjectionSettings":
+        return _auto_from_dict(ProjectionSettings, d, mode, alias_map={
+            "defocus": "defocus_nm", "camera_length": "camera_length_mm"
+        })
+
+@dataclass
+class ProjectionSystemSettings:
+    """
+    Safety limits for the Projection system.
+
+    Role:     Gatekeeper (System Limits)
+    Context:  Control-plane
+    Category: A (Strict Runtime Config)
+
+    Attributes:
+        enabled (Optional[bool]): Master toggle for projection controls.
+            None Behavior: Defaulted to True.
+        default_projection (Optional[ProjectionSettings]): Baseline settings.
+            None Behavior: Structural Default (Empty object).
+        camera_length_limits (Optional[Tuple[Quantity, Quantity]]): Valid range for diffraction.
+            None Behavior: Preserved as None (Unlimited).
+        magnification_limits (Optional[Tuple[int, int]]): Valid range for mag indices.
+            None Behavior: Preserved as None (Unlimited).
+        defocus_limits (Optional[Tuple[Quantity, Quantity]]): Safety limits for defocus.
+            None Behavior: Preserved as None (Unlimited).
+    """
+    enabled: Optional[bool] = None
+    default_projection: Optional[ProjectionSettings] = None
+
+    # Limits
+    camera_length_limits: Optional[Tuple["Quantity", "Quantity"]] = None
+    magnification_limits: Optional[Tuple[int, int]] = None
+    defocus_limits: Optional[Tuple["Quantity", "Quantity"]] = None
+
+    extra: Extras = field(default_factory=Extras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+
+    _UNITS = {
+        "camera_length_limits": Units.MM,
+        "defocus_limits": Units.NM
+    }
+
+    def __post_init__(self):
+        p = FieldParser(self, self._mode, "ProjectionSystemSettings")
+        self.enabled = p.bool(self.enabled, "enabled", default=True)
+        self.default_projection = p.model(ProjectionSettings, self.default_projection, "default_projection",
+                                          default=ProjectionSettings(_mode=p.mode))
+
+        self.camera_length_limits = p.pair_qty(self.camera_length_limits, "camera_length_limits", Units.MM)
+        self.magnification_limits = p.pair_int(self.magnification_limits, "magnification_limits")
+        self.defocus_limits = p.pair_qty(self.defocus_limits, "defocus_limits", Units.NM)
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        v = Validator(self, mode)
+        # Standard range logic (simplified for brevity)
+        if self.camera_length_limits:
+            mn, mx = self.camera_length_limits
+            v.check(mn <= mx, "camera_length_limits", "min > max")
+        return v.valid
+
+    def is_safe_projection(self, target: ProjectionSettings) -> SafetyCheck:
+        reasons = []
+
+        # Check Diffraction Limits
+        if target.optical_mode == "DIFFRACTION" and target.camera_length is not None:
+            if self.camera_length_limits:
+                mn, mx = self.camera_length_limits
+                if not (mn <= target.camera_length <= mx):
+                    reasons.append(f"Camera length {target.camera_length} outside limits {self.camera_length_limits}")
+
+        # Check Defocus Limits
+        if target.defocus is not None and self.defocus_limits:
+            mn, mx = self.defocus_limits
+            if not (mn <= target.defocus <= mx):
+                reasons.append(f"Defocus {target.defocus} outside limits {self.defocus_limits}")
+
+        # Check Mag Limits
+        if target.magnification_index is not None and self.magnification_limits:
+            mn, mx = self.magnification_limits
+            if not (mn <= target.magnification_index <= mx):
+                reasons.append(f"Mag index {target.magnification_index} outside limits {self.magnification_limits}")
+
+        return SafetyCheck(allowed=(len(reasons) == 0), reasons=reasons)
+
+    def to_dict(self) -> dict:
+        return _auto_to_dict(self, unit_map=self._UNITS)
+
+    @staticmethod
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "ProjectionSystemSettings":
+        return _auto_from_dict(ProjectionSystemSettings, d, mode, alias_map={
+            "camera_length_limits": "camera_length_limits_mm",
+            "defocus_limits": "defocus_limits_nm"
+        })
+
+@dataclass
+class DetectorSettings:
+    """
+    Detector parameters for state reporting and acquisition requests.
+
+    Role:     Dual-Use (Snapshot and Intent)
+    Context:  Both (Data-plane / Control-plane)
+    Category: C / D (Measured State / Intent)
+
+    Attributes:
+        detector_id (Optional[str]): The identifier of the camera.
+            None Behavior: Preserved as None.
         exposure (Optional[Quantity]): Integration time. Units: ms.
             None Behavior: Snapshot (Unknown) | Intent (No Change).
-        roi (Optional[ROI]): Pixel-coordinate window on the sensor.
-            None Behavior: Snapshot (Unknown/Full) | Intent (No Change).
+        binning_index (Optional[int]): Discrete binning level.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        binning_xy (Optional[Tuple[int, int]]): Explicit X/Y binning.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        roi (Optional[ROI]): Sub-region readout window.
+            None Behavior: Snapshot (Full Sensor) | Intent (No Change).
+        frame_integration (Optional[int]): Number of internal hardware averages.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        gain_index, offset_index (Optional[int]): Sensor amplifier settings.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        digital_rotation (Optional[Quantity]): Post-processing rotation. Units: deg.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        frame_rate (Optional[Quantity]): Continuous acquisition speed. Units: Hz.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        total_frames (Optional[int]): Number of frames to capture (Movie mode).
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        readout_mode (Optional[str]): Sensor readout strategy (e.g. "LINEAR").
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        shutter_mode (Optional[str]): Shutter timing (e.g. "PRE_SPECIMEN").
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        save_frames (Optional[bool]): Whether to save individual movie frames.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+
+    Behavior:
+        1. Snapshot (Telemetry): Represents the idle state of the camera.
+        2. Intent (Control): Used to configure the camera permanently.
+        3. Intent (Acquisition): Used ephemerally for a single 'Take Picture' event.
+           Values defined here override the persistent camera state for that one shot.
     """
     detector_id: Optional[str] = None
     exposure: Optional["Quantity"] = None
@@ -1712,24 +2187,43 @@ class DetectorSettings:
     frame_integration: Optional[int] = None
     gain_index: Optional[int] = None
     offset_index: Optional[int] = None
-    digital_rotation_deg: Optional[float] = None
+    digital_rotation: Optional["Quantity"] = None
+    frame_rate: Optional["Quantity"] = None  # e.g. 40 Hz
+    total_frames: Optional[int] = None  # e.g. 40 frames
+
+    # --- NEW ADVANCED PROPERTIES ---
+    readout_mode: Optional[str] = None  # "LINEAR", "COUNTING", "SUPER_RESOLUTION"
+    shutter_mode: Optional[str] = None  # "PRE_SPECIMEN", "POST_SPECIMEN"
+    save_frames: Optional[bool] = None  # True = save movie stack
+
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
-    _UNITS = {"exposure": Units.MS}
+    _UNITS = {
+        "exposure": Units.MS,
+        "digital_rotation": Units.DEG,
+        "frame_rate": Units.HZ  # <--- NEW UNIT
+    }
 
     def __post_init__(self):
         p = FieldParser(self, self._mode, "DetectorSettings")
         self.detector_id = p.id(self.detector_id, "detector_id")
         self.binning_index = p.int(self.binning_index, "binning_index")
         self.binning_xy = p.pair_int(self.binning_xy, "binning_xy")
+        self.frame_rate = p.qty(self.frame_rate, "frame_rate", Units.HZ)
+        self.total_frames = p.int(self.total_frames, "total_frames")
         self.frame_integration = p.int(self.frame_integration, "frame_integration")
         self.gain_index = p.int(self.gain_index, "gain_index")
         self.offset_index = p.int(self.offset_index, "offset_index")
-        self.digital_rotation_deg = p.float(self.digital_rotation_deg, "digital_rotation_deg")
+        self.digital_rotation = p.qty(self.digital_rotation, "digital_rotation", Units.DEG)
         self.exposure = p.qty(self.exposure, "exposure", Units.MS)
         # ROI is preserved as None if missing (tristate)
         self.roi = p.model(ROI, self.roi, "roi", default=None)
+
+        # --- NEW PARSERS ---
+        self.readout_mode = p.str(self.readout_mode, "readout_mode")
+        self.shutter_mode = p.str(self.shutter_mode, "shutter_mode")
+        self.save_frames = p.bool(self.save_frames, "save_frames")
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
@@ -1747,7 +2241,20 @@ class DetectorSettings:
                 "gain_index", "must be >= 0",
                 heal=lambda: setattr(self, 'gain_index', 0))
 
+        if self.exposure and self.frame_rate and self.total_frames:
+            exp_sec = self.exposure.to(Units.SEC).magnitude
+            rate_hz = self.frame_rate.to(Units.HZ).magnitude
+            # Logic: Exposure * Rate ~= Frames
+            if rate_hz > 0:
+                calc_frames = int(exp_sec * rate_hz)
+                # Tolerate +/- 1 frame rounding error
+                v.check(abs(calc_frames - self.total_frames) <= 1, "dose_logic",
+                        f"Mismatch: {exp_sec}s * {rate_hz}Hz != {self.total_frames}")
+
         v.check_nested(self.roi)
+        if self.shutter_mode:
+            v.check(self.shutter_mode in {"PRE_SPECIMEN", "POST_SPECIMEN", "BOTH"}, "shutter_mode",
+                    "Invalid shutter mode")
         return v.valid
 
     def to_dict(self) -> dict:
@@ -1756,7 +2263,9 @@ class DetectorSettings:
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "DetectorSettings":
         return _auto_from_dict(DetectorSettings, d, mode, alias_map={
-            "exposure": "exposure_ms"
+            "exposure": "exposure_ms",
+            "digital_rotation": "digital_rotation_deg",
+            "frame_rate": "frame_rate_hz"
         })
 
 # Alias for semantic clarity in Read-Only contexts
@@ -1765,17 +2274,25 @@ DetectorState = DetectorSettings
 @dataclass
 class DetectorCapabilities:
     """
-    Hardware-specific profile used to assess if a request is supported by the device.
+    Hardware-specific profile of detector features and limits.
 
     Role:     Gatekeeper (Capabilities)
     Context:  Control-plane
     Category: C (Measured State)
 
     Attributes:
-        can_binning (Optional[bool]): If the sensor supports hardware pixel grouping.
-            None Behavior: Preserved as None (Unknown).
-        exposure_min, exposure_max (Optional[Quantity]): Physical timing limits. Units: ms.
-            None Behavior: Preserved as None (Unknown).
+        can_binning (Optional[bool]): Supports pixel binning.
+        binning_index_min, binning_index_max (Optional[int]): Range of bin indices.
+        binning_xy_min, binning_xy_max (Optional[Tuple[int, int]]): Range of bin factors.
+        exposure_min, exposure_max (Optional[Quantity]): Exposure limits. Units: ms.
+        frame_integration_min, frame_integration_max (Optional[int]): Averaging limits.
+        roi_size_min, roi_size_max (Optional[Tuple[int, int]]): ROI dimension limits.
+        can_gain (Optional[bool]): Supports gain adjustment.
+        gain_index_min, gain_index_max (Optional[int]): Gain limits.
+        can_offset (Optional[bool]): Supports offset adjustment.
+        offset_index_min, offset_index_max (Optional[int]): Offset limits.
+        can_digital_rotation (Optional[bool]): Supports hardware rotation.
+        digital_rotation_min, digital_rotation_max (Optional[Quantity]): Rotation limits.
     """
     can_binning: Optional[bool] = None
     binning_index_min: Optional[int] = None
@@ -1948,27 +2465,21 @@ class DetectorCapabilities:
             if self.offset_index_max is not None and oi > self.offset_index_max:
                 reasons.append(f"Offset Index {oi} exceeds limit {self.offset_index_max}.")
 
-        # --- 5. Digital Rotation ---
-        if settings.digital_rotation_deg is not None:
-            rot_val = settings.digital_rotation_deg
+        # --- 5. Digital Rotation (Cleaned Up) ---
+        if settings.digital_rotation is not None:
+            rot_val = settings.digital_rotation
 
-            if self.can_digital_rotation is False and rot_val != 0.0:
-                reasons.append(f"Digital Rotation {rot_val}° requested, but 'can_digital_rotation' is False.")
+            if self.can_digital_rotation is False:
+                # Check if rotation is non-zero (using magnitude for safety against -0.0)
+                if abs(rot_val.magnitude) > 1e-6:
+                    reasons.append(
+                        f"Digital Rotation {rot_val} requested, but 'can_digital_rotation' is False.")
 
-            # Helper to extract magnitude safely for comparison
-            # (Settings uses float deg, Capabilities uses Quantity)
-            def _get_deg(q):
-                return q.to(Units.DEG).magnitude if hasattr(q, 'to') else q
+            if self.digital_rotation_min is not None and rot_val < self.digital_rotation_min:
+                reasons.append(f"Digital Rotation {rot_val} below limit {self.digital_rotation_min}.")
 
-            if self.digital_rotation_min is not None:
-                min_r = _get_deg(self.digital_rotation_min)
-                if rot_val < min_r:
-                    reasons.append(f"Digital Rotation {rot_val}° below limit {self.digital_rotation_min}.")
-
-            if self.digital_rotation_max is not None:
-                max_r = _get_deg(self.digital_rotation_max)
-                if rot_val > max_r:
-                    reasons.append(f"Digital Rotation {rot_val}° exceeds limit {self.digital_rotation_max}.")
+            if self.digital_rotation_max is not None and rot_val > self.digital_rotation_max:
+                reasons.append(f"Digital Rotation {rot_val} exceeds limit {self.digital_rotation_max}.")
 
         # --- 6. ROI Checks ---
         if settings.roi is not None:
@@ -2001,15 +2512,19 @@ class DetectorCapabilities:
 @dataclass
 class DetectorSystemSettings:
     """
-    Registry for available detectors and their associated capability profiles.
+    Registry for available detectors and their capability profiles.
 
     Role:     Gatekeeper (System Registry)
     Context:  Control-plane
     Category: B (Structural Container)
 
     Attributes:
+        enabled (Optional[bool]): Master toggle for detector system.
+            None Behavior: Defaulted to True.
         available_detector_ids (Optional[List[str]]): List of known device names.
             None Behavior: Structural Default (Empty List).
+        default_detector_id (Optional[str]): Primary detector name.
+            None Behavior: Preserved as None.
         defaults_by_id (Optional[Dict[str, DetectorSettings]]): Base settings per device.
             None Behavior: Structural Default (Empty Dict).
         capabilities_by_id (Optional[Dict[str, DetectorCapabilities]]): Hardware limits per device.
@@ -2043,12 +2558,20 @@ class DetectorSystemSettings:
                     f"Default '{self.default_detector_id}' is unknown",
                     heal=lambda: setattr(self, 'default_detector_id', None))
 
-        # 2. Completeness (Strict only logic in original)
-        missing_defaults = ids_available - set(self.defaults_by_id.keys())
-        v.check(not missing_defaults, "completeness", f"Missing defaults for: {missing_defaults}")
+            # 2. Completeness (Heal by removing the broken ID from availability)
+            def _heal_missing(missing_set):
+                # Remove the IDs that have no config from the available list
+                self.available_detector_ids = [x for x in self.available_detector_ids if x not in missing_set]
 
-        missing_caps = ids_available - set(self.capabilities_by_id.keys())
-        v.check(not missing_caps, "completeness", f"Missing capabilities for: {missing_caps}")
+            missing_defaults = ids_available - set(self.defaults_by_id.keys())
+            v.check(not missing_defaults, "completeness.defaults",
+                    f"Missing defaults for: {missing_defaults}",
+                    heal=lambda: _heal_missing(missing_defaults))
+
+            missing_caps = ids_available - set(self.capabilities_by_id.keys())
+            v.check(not missing_caps, "completeness.capabilities",
+                    f"Missing capabilities for: {missing_caps}",
+                    heal=lambda: _heal_missing(missing_caps))
 
         # 3. Recursive Checks
         v.check_nested_map(self.defaults_by_id)
@@ -2061,9 +2584,7 @@ class DetectorSystemSettings:
 
         caps = self.capabilities_by_id.get(settings.detector_id)
         if not caps:
-            # If we don't know the capabilities, do we fail safe or fail open?
-            # Usually fail open (True) if lenient, but here explicit is better.
-            return SafetyCheck.success()
+            return SafetyCheck.failure(f"Unknown capabilities for detector '{settings.detector_id}'")
 
         return caps.supports(settings)
 
@@ -2077,44 +2598,274 @@ class DetectorSystemSettings:
         })
 
 @dataclass
-class ImageOutputSettings:
+class ScanSettings:
     """
-    Configuration for naming conventions and storage formats for acquired data.
+    Configuration for the STEM raster scan engine.
 
-    Role:     Gatekeeper (Output Config)
-    Context:  Control-plane
-    Category: A (Config)
+    Role:     Dual-Use (Snapshot and Intent)
+    Context:  Both (Data-plane / Control-plane)
+    Category: C / D (Measured State / Intent)
 
     Attributes:
-        file_format (Optional[str]): Destination format (tiff, png, jpg, bmp).
-            None Behavior: Defaulted to "tiff".
-        path (Optional[str]): Base directory or template for saving files.
-            None Behavior: Preserved as None (implies auto-selection or current dir).
+        scan_mode (Optional[str]): The scanning strategy (e.g. "Full Frame").
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        width_px (Optional[int]): Scan grid width.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        height_px (Optional[int]): Scan grid height.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        pixel_dwell_time (Optional[Quantity]): Time per pixel. Units: us.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        flyback_time (Optional[Quantity]): Retrace time between lines. Units: us.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        scan_rotation (Optional[Quantity]): Rotation of scan axes. Units: deg.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+
+    Behavior:
+        1. Snapshot (Telemetry): Represents the currently active scan parameters.
+        2. Intent (Control): Used in `ScanControlRequest` to configure the engine.
+           Any field set to None retains the previous value.
     """
-    file_format: Optional[str] = None
-    path: Optional[str] = None
+    scan_mode: Optional[str] = None
+
+    # --- ADDED: Grid Dimensions ---
+    width_px: Optional[int] = None
+    height_px: Optional[int] = None
+
+    pixel_dwell_time: Optional["Quantity"] = None
+    flyback_time: Optional["Quantity"] = None
+
+    # Moved here from BeamSettings
+    scan_rotation: Optional["Quantity"] = None
+
     extra: Extras = field(default_factory=Extras)
-    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False, compare=False)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+
+    _UNITS = {
+        "pixel_dwell_time": Units.US,
+        "flyback_time": Units.US,
+        "scan_rotation": Units.DEG
+    }
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "ImageOutputSettings")
-        _fmt = p.str(self.file_format, "file_format")
-        self.file_format = (_fmt.lower() if _fmt else "tiff")
-        self.path = p.str(self.path, "path")
+        p = FieldParser(self, self._mode, "ScanSettings")
+        self.scan_mode = p.str(self.scan_mode, "scan_mode")
+
+        # --- ADDED: Parsers ---
+        self.width_px = p.int(self.width_px, "width_px")
+        self.height_px = p.int(self.height_px, "height_px")
+
+        self.pixel_dwell_time = p.qty(self.pixel_dwell_time, "pixel_dwell_time", Units.US)
+        self.flyback_time = p.qty(self.flyback_time, "flyback_time", Units.US)
+        self.scan_rotation = p.qty(self.scan_rotation, "scan_rotation", Units.DEG)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
-        v.check(self.file_format in {"tiff", "tif", "png", "jpg", "jpeg", "bmp"},
-                "file_format", f"Unsupported format: {self.file_format}",
-                heal=lambda: setattr(self, 'file_format', "tiff"))
+        v.check_gt_zero(self.pixel_dwell_time, "pixel_dwell_time", unit_aware=True, reset_to=None)
+        v.check_ge_zero(self.flyback_time, "flyback_time", unit_aware=True, reset_to=None)
+        if self.width_px:
+            v.check(self.width_px > 0, "width_px", ">0", heal=lambda: setattr(self, 'width_px', 512))
+        if self.height_px:
+            v.check(self.height_px > 0, "height_px", ">0", heal=lambda: setattr(self, 'height_px', 512))
+        return v.valid
+
+    @property
+    def estimated_duration(self) -> Optional["Quantity"]:
+        """Helper to calculate total scan time."""
+        if None in (self.width_px, self.height_px, self.pixel_dwell_time): return None
+
+        # (W * H * Dwell) + (H * Flyback)
+        t_dwell = self.width_px * self.height_px * self.pixel_dwell_time.to(Units.US).magnitude
+        t_fly = 0
+        if self.flyback_time:
+            t_fly = self.height_px * self.flyback_time.to(Units.US).magnitude
+
+        return Q_((t_dwell + t_fly) / 1e6, Units.SEC)
+
+    def to_dict(self) -> dict:
+        return _auto_to_dict(self, unit_map=self._UNITS)
+
+    @staticmethod
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "ScanSettings":
+        return _auto_from_dict(ScanSettings, d, mode, alias_map={
+            "pixel_dwell_time": "pixel_dwell_time_us",
+            "flyback_time": "flyback_time_us",
+            "scan_rotation": "scan_rotation_deg"
+        })
+
+@dataclass
+class ScanSystemSettings:
+    """
+    Hardware capabilities and limits for the STEM scan engine.
+
+    Role:     Gatekeeper (System Limits)
+    Context:  Control-plane
+    Category: A (Strict Runtime Config)
+
+    Attributes:
+        enabled (Optional[bool]): Master toggle for scan engine.
+            None Behavior: Defaulted to True.
+        available_scan_modes (Optional[List[str]]): Supported strategies.
+            None Behavior: Preserved as None.
+        pixel_dwell_time_limits (Optional[Tuple[Quantity, Quantity]]): Min/Max dwell.
+            None Behavior: Preserved as None (Unlimited).
+        flyback_time_limits (Optional[Tuple[Quantity, Quantity]]): Min/Max flyback.
+            None Behavior: Preserved as None (Unlimited).
+        scan_rotation_limits (Optional[Tuple[Quantity, Quantity]]): Min/Max rotation.
+            None Behavior: Preserved as None (Unlimited).
+    """
+    enabled: Optional[bool] = None
+
+    # --- Capabilities ---
+    available_scan_modes: Optional[List[str]] = None  # e.g. ["SPOT", "FULL_FRAME"]
+
+    # --- Limits ---
+    pixel_dwell_time_limits: Optional[Tuple["Quantity", "Quantity"]] = None
+    flyback_time_limits: Optional[Tuple["Quantity", "Quantity"]] = None
+    scan_rotation_limits: Optional[Tuple["Quantity", "Quantity"]] = None
+
+    extra: Extras = field(default_factory=Extras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+
+    _UNITS = {
+        "pixel_dwell_time_limits": Units.US,
+        "flyback_time_limits": Units.US,
+        "scan_rotation_limits": Units.DEG
+    }
+
+    def __post_init__(self):
+        p = FieldParser(self, self._mode, "ScanSystemSettings")
+        self.enabled = p.bool(self.enabled, "enabled", default=True)
+        self.available_scan_modes = p.list_str(self.available_scan_modes, "available_scan_modes")
+
+        self.pixel_dwell_time_limits = p.pair_qty(self.pixel_dwell_time_limits, "pixel_dwell_time_limits", Units.US)
+        self.flyback_time_limits = p.pair_qty(self.flyback_time_limits, "flyback_time_limits", Units.US)
+        self.scan_rotation_limits = p.pair_qty(self.scan_rotation_limits, "scan_rotation_limits", Units.DEG)
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        v = Validator(self, mode)
+
+        def _check_range(rng, name):
+            if not rng: return
+            mn, mx = rng
+            v.check(mn <= mx, name, "min > max", heal=lambda: setattr(self, name, (mx, mn)))
+            # Timing cannot be negative
+            if "rotation" not in name:
+                v.check_ge_zero(mn, f"{name}.min", unit_aware=True)
+
+        _check_range(self.pixel_dwell_time_limits, "pixel_dwell_time_limits")
+        _check_range(self.flyback_time_limits, "flyback_time_limits")
+        _check_range(self.scan_rotation_limits, "scan_rotation_limits")
+
+        return v.valid
+
+    def is_safe_scan(self, settings: "ScanSettings") -> SafetyCheck:
+        """
+        Runtime check: Is the requested scan within hardware timing limits?
+        """
+        reasons = []
+
+        # 1. Check Mode
+        if settings.scan_mode and self.available_scan_modes:
+            if settings.scan_mode not in self.available_scan_modes:
+                reasons.append(f"Scan mode '{settings.scan_mode}' not supported {self.available_scan_modes}")
+
+        # 2. Check Timing Limits
+        def _chk(val, lims, name):
+            if val is not None and lims:
+                if not (lims[0] <= val <= lims[1]):
+                    reasons.append(f"{name} {val} outside limits {lims}")
+
+        _chk(settings.pixel_dwell_time, self.pixel_dwell_time_limits, "dwell_time")
+        _chk(settings.flyback_time, self.flyback_time_limits, "flyback_time")
+        _chk(settings.scan_rotation, self.scan_rotation_limits, "scan_rotation")
+
+        return SafetyCheck(allowed=(len(reasons) == 0), reasons=reasons)
+
+    def to_dict(self) -> dict:
+        return _auto_to_dict(self, unit_map=self._UNITS)
+
+    @staticmethod
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "ScanSystemSettings":
+        return _auto_from_dict(ScanSystemSettings, d, mode, alias_map={
+            "pixel_dwell_time_limits": "pixel_dwell_time_limits_us",
+            "flyback_time_limits": "flyback_time_limits_us",
+            "scan_rotation_limits": "scan_rotation_limits_deg"
+        })
+
+@dataclass
+class VacuumSettings:
+    """
+    Status and control of the vacuum system (Valves, Pumps, Pressures).
+
+    Role:     Dual-Use (Snapshot and Intent)
+    Context:  Control-plane
+    Category: C / D (Measured State / Intent)
+
+    Attributes:
+        column_valve_state (Optional[str]): V7/V4 state ("OPEN", "CLOSED").
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        gun_valve_state (Optional[str]): V1 state ("OPEN", "CLOSED").
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        turbo_pump_state (Optional[str]): Turbo status ("ON", "OFF").
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        column_pressure (Optional[Quantity]): Column gauge. Units: Pa.
+            None Behavior: Snapshot (Unknown).
+        gun_pressure (Optional[Quantity]): Gun/FEG gauge. Units: Pa.
+            None Behavior: Snapshot (Unknown).
+        buffer_tank_pressure (Optional[Quantity]): Buffer gauge. Units: Pa.
+            None Behavior: Snapshot (Unknown).
+
+    Behavior:
+        1. Snapshot (Telemetry): Returns all valve states and gauge readings.
+        2. Intent (Control): Only 'state' fields (valves/pumps) are actionable.
+           Pressure fields are Read-Only; setting them in a request is ignored.
+    """
+    column_valve_state: Optional[str] = None  # "OPEN", "CLOSED" (aka V7/V4)
+    gun_valve_state: Optional[str] = None  # "OPEN", "CLOSED" (aka V1)
+    turbo_pump_state: Optional[str] = None  # "ON", "OFF"
+
+    # Telemetry Only (Usually)
+    column_pressure: Optional["Quantity"] = None
+    gun_pressure: Optional["Quantity"] = None
+    buffer_tank_pressure: Optional["Quantity"] = None
+
+    extra: Extras = field(default_factory=Extras)
+    _mode: ParseMode = field(default=ParseMode.LENIENT, repr=False)
+
+    _UNITS = {
+        "column_pressure": Units.PA,
+        "gun_pressure": Units.PA,
+        "buffer_tank_pressure": Units.PA
+    }
+
+    def __post_init__(self):
+        p = FieldParser(self, self._mode, "VacuumSettings")
+        self.column_valve_state = p.str(self.column_valve_state, "column_valve_state")
+        self.gun_valve_state = p.str(self.gun_valve_state, "gun_valve_state")
+        self.turbo_pump_state = p.str(self.turbo_pump_state, "turbo_pump_state")
+
+        self.column_pressure = p.qty(self.column_pressure, "column_pressure", Units.PA)
+        self.gun_pressure = p.qty(self.gun_pressure, "gun_pressure", Units.PA)
+        self.buffer_tank_pressure = p.qty(self.buffer_tank_pressure, "buffer_tank_pressure", Units.PA)
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        v = Validator(self, mode)
+        # Pressure can't be negative
+        v.check_ge_zero(self.column_pressure, "column_pressure", unit_aware=True)
+        v.check_ge_zero(self.gun_pressure, "gun_pressure", unit_aware=True)
         return v.valid
 
     def to_dict(self) -> dict:
-        return _auto_to_dict(self)
+        return _auto_to_dict(self, unit_map=self._UNITS)
 
     @staticmethod
-    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "ImageOutputSettings":
-        return _auto_from_dict(ImageOutputSettings, d, mode)
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "VacuumSettings":
+        return _auto_from_dict(VacuumSettings, d, mode, alias_map={
+            "column_valve_state": "column_valve",
+            "column_pressure": "column_pressure_pa",
+            "gun_pressure": "gun_pressure_pa",
+            "buffer_tank_pressure": "buffer_tank_pressure_pa"
+        })
 
 @dataclass
 class Aperture:
@@ -2126,10 +2877,21 @@ class Aperture:
     Category: C / D (Measured State / Intent)
 
     Attributes:
+        aperture_id (Optional[str]): The mechanism ID (e.g. "condenser", "objective").
+            None Behavior: Preserved as None.
         inserted (Optional[bool]): Whether the aperture is in the beam path.
             None Behavior: Snapshot (Unknown) | Intent (No Change).
         size_index (Optional[int]): The currently selected hole size index.
             None Behavior: Snapshot (Unknown) | Intent (No Change).
+        position (Optional[Point]): Mechanical micro-position.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+
+    Behavior:
+        1. Snapshot (Telemetry): Represents the current mechanism state.
+        2. Intent (Control): Represents a desire to change state.
+           - Insert/Retract: Set `inserted` to True/False.
+           - Change Size: Set `size_index`.
+           - Align: Set `position`.
     """
     aperture_id: Optional[str] = None
     inserted: Optional[bool] = None
@@ -2175,17 +2937,29 @@ class MicroscopeState:
     Category: C (Nullable Runtime)
 
     Attributes:
-        timestamp (Optional[str]): ISO8601 formatted time of capture.
-            None Behavior: Defaulted to "Now" if missing during ingestion.
+        timestamp (Optional[str]): ISO8601 time of capture.
+            None Behavior: Defaulted to "Now".
+        mode (Optional[str]): Global instrument mode (e.g. "STEM", "TEM").
+            None Behavior: Preserved as None.
         stage_position (Optional[StagePosition]): Current physical coordinates.
-            None Behavior: Structural Default (Empty StagePosition).
+        beam (Optional[BeamSettings]): Current gun/optics state.
+        projection (Optional[ProjectionSettings]): Current imaging state.
+        scan (Optional[ScanSettings]): Current raster state.
+        vacuum (Optional[VacuumSettings]): Current vacuum state.
+        apertures (Optional[Dict[str, Aperture]]): State of all apertures.
+        detectors (Optional[Dict[str, DetectorSettings]]): State of all cameras.
+        active_detector_ids (Optional[List[str]]): List of currently active cameras.
+        primary_detector_id (Optional[str]): The main camera in use.
     """
     timestamp: Optional[str] = None
     mode: Optional[str] = None
     stage_position: Optional[StagePosition] = None
-    beam: Optional[BeamState] = None
+    beam: Optional[BeamSettings] = None
+    projection: Optional[ProjectionSettings] = None  # --- ADDED ---
+    scan: Optional[ScanSettings] = None
+    vacuum: Optional[VacuumSettings] = None
     apertures: Optional[Dict[str, Aperture]] = None
-    detectors: Optional[Dict[str, DetectorState]] = None
+    detectors: Optional[Dict[str, DetectorSettings]] = None
     active_detector_ids: Optional[List[str]] = None
     primary_detector_id: Optional[str] = None
     extra: Extras = field(default_factory=Extras)
@@ -2202,6 +2976,11 @@ class MicroscopeState:
         self.stage_position = p.model(StagePosition, self.stage_position, "stage_position",
                                       default=StagePosition(_mode=p.mode))
         self.beam = p.model(BeamState, self.beam, "beam", default=BeamState(_mode=p.mode))
+        self.projection = p.model(ProjectionSettings, self.projection, "projection",
+                                  default=ProjectionSettings(_mode=p.mode))
+        self.scan = p.model(ScanSettings, self.scan, "scan", default=ScanSettings(_mode=p.mode))
+        self.vacuum = p.model(VacuumSettings, self.vacuum, "vacuum", default=VacuumSettings(_mode=p.mode))  # <--- NEW
+
         self.apertures = p.map_model(Aperture, self.apertures, "apertures", "aperture_id")
         self.detectors = p.map_model(DetectorState, self.detectors, "detectors", "detector_id")
 
@@ -2209,12 +2988,15 @@ class MicroscopeState:
         v = Validator(self, mode)
         v.check_nested(self.stage_position)
         v.check_nested(self.beam)
+        v.check_nested(self.projection)
+        v.check_nested(self.scan)
+        v.check_nested(self.vacuum)  # <--- NEW
         v.check_nested_map(self.apertures)
         v.check_nested_map(self.detectors)
 
         valid_ids = []
         for det_id in self.active_detector_ids:
-            if not v.check(det_id in self.detectors, "active_detector_ids",
+            if not v.check(det_id in self.detectors, f"active_detector_ids.{det_id}",
                            f"Active detector '{det_id}' not found"):
                 continue  # Skip adding to valid_ids if check failed
             valid_ids.append(det_id)
@@ -2232,21 +3014,23 @@ class MicroscopeState:
 @dataclass
 class MicroscopeImageMetadata:
     """
-    The scientific 'sidecar' metadata describing the context of an image acquisition.
+    Scientific metadata describing the context of an image acquisition.
 
     Role:     Snapshot (Scientific Context)
     Context:  Data-plane
     Category: C (Measured State)
 
     Attributes:
-        magnification (Optional[float]): The indicated microscope magnification.
-            None Behavior: Preserved as None (Unknown).
-        pixel_size_nm (Optional[Tuple[float, float]]): Calibrated pixel dimensions. Units: nm.
-            None Behavior: Preserved as None (Unknown).
-        microscope_state (Optional[MicroscopeState]): Full machine telemetry at acquisition.
-            None Behavior: Preserved as None.
-        created_at (Optional[str]): ISO8601 timestamp of acquisition.
-            None Behavior: Defaulted to 'Now' if missing during ingestion.
+        version (Optional[str]): Metadata schema version.
+        created_at (Optional[str]): Acquisition timestamp.
+        magnification (Optional[float]): Indicated mag.
+        camera_length_mm (Optional[float]): Indicated camera length.
+        pixel_size_nm (Optional[Tuple[float, float]]): Calibrated pixel scale (X, Y).
+        image_size_px (Optional[Tuple[int, int]]): Image dimensions (W, H).
+        accelerating_voltage_kv (Optional[float]): Beam voltage.
+        beam_current_na (Optional[float]): Beam current.
+        exposure_ms (Optional[float]): Exposure time.
+        microscope_state (Optional[MicroscopeState]): Full telemetry snapshot.
     """
     version: Optional[str] = None
     created_at: Optional[str] = None
@@ -2429,23 +3213,61 @@ class MicroscopeImage:
         return path
 
 @dataclass
+class ImageOutputSettings:
+    """
+    Configuration for naming conventions and storage formats.
+
+    Role:     Gatekeeper (Output Config)
+    Context:  Control-plane
+    Category: A (Config)
+
+    Attributes:
+        file_format (Optional[str]): "tiff", "png", "jpg", or "bmp".
+            None Behavior: Defaulted to "tiff".
+        path (Optional[str]): Destination directory or path template.
+            None Behavior: Preserved as None.
+    """
+    file_format: Optional[str] = None
+    path: Optional[str] = None
+    extra: Extras = field(default_factory=Extras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False, compare=False)
+
+    def __post_init__(self):
+        p = FieldParser(self, self._mode, "ImageOutputSettings")
+        _fmt = p.str(self.file_format, "file_format")
+        self.file_format = (_fmt.lower() if _fmt else "tiff")
+        self.path = p.str(self.path, "path")
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        v = Validator(self, mode)
+        v.check(self.file_format in {"tiff", "tif", "png", "jpg", "jpeg", "bmp"},
+                "file_format", f"Unsupported format: {self.file_format}",
+                heal=lambda: setattr(self, 'file_format', "tiff"))
+        return v.valid
+
+    def to_dict(self) -> dict:
+        return _auto_to_dict(self)
+
+    @staticmethod
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "ImageOutputSettings":
+        return _auto_from_dict(ImageOutputSettings, d, mode)
+
+@dataclass
 class SystemInfo:
     """
     Static identifying information about the microscope hardware and software.
 
     Role:     Structure / Identity
-    Context:  Both (Data-plane / Control-plane)
+    Context:  Data-plane
     Category: A (Config/Identity)
 
     Attributes:
-        name (Optional[str]): Human-readable name of the system.
-            None Behavior: Defaulted to "Unknown".
-        ip_address (Optional[str]): Network address for the microscope control PC.
-            None Behavior: Defaulted to "Unknown"; validated as IP format.
-        supertem_version (Optional[str]): Version of the SuperTEM library.
-            None Behavior: Defaulted to the current installed package version.
-        manufacturer, model, serial_number (Optional[str]): Hardware identifiers.
-            None Behavior: Defaulted to "Unknown".
+        name (Optional[str]): Human-readable system name.
+        ip_address (Optional[str]): Control PC network address.
+        manufacturer, model, serial_number (Optional[str]): Hardware IDs.
+        hardware_version, software_version (Optional[str]): Vendor versions.
+        supertem_version (Optional[str]): Library version.
+        application, application_version (Optional[str]): Client app info.
     """
     name: Optional[str] = None
     ip_address: Optional[str] = None
@@ -2496,21 +3318,21 @@ class SystemSettings:
     Root container for system-wide settings and limit registries.
 
     Role:     Structure / Gateway
-    Context:  Both (Data-plane / Control-plane)
+    Context:  Control-plane
     Category: B (Structural Container)
 
     Attributes:
-        stage_system (Optional[StageSystemSettings]): Limits for sample motion.
-            None Behavior: Structural Default (Empty StageSystemSettings).
-        beam_system (Optional[BeamSystemSettings]): Limits for optics and voltage.
-            None Behavior: Structural Default (Empty BeamSystemSettings).
-        detector_system (Optional[DetectorSystemSettings]): Registry of camera hardware.
-            None Behavior: Structural Default (Empty DetectorSystemSettings).
-        info (Optional[SystemInfo]): Static hardware/software identification.
-            None Behavior: Structural Default (Empty SystemInfo).
+        stage_system (Optional[StageSystemSettings]): Stage limits.
+        beam_system (Optional[BeamSystemSettings]): Beam limits.
+        projection_system (Optional[ProjectionSystemSettings]): Projection limits.
+        scan_system (Optional[ScanSystemSettings]): Scan limits.
+        detector_system (Optional[DetectorSystemSettings]): Detector registry.
+        info (Optional[SystemInfo]): Static identity.
     """
     stage_system: Optional[StageSystemSettings] = None
     beam_system: Optional[BeamSystemSettings] = None
+    projection_system: Optional[ProjectionSystemSettings] = None
+    scan_system: Optional[ScanSystemSettings] = None  # <--- NEW
     detector_system: Optional[DetectorSystemSettings] = None
     info: Optional[SystemInfo] = None
     extra: Extras = field(default_factory=Extras)
@@ -2522,6 +3344,13 @@ class SystemSettings:
                                     default=StageSystemSettings(_mode=p.mode))
         self.beam_system = p.model(BeamSystemSettings, self.beam_system, "beam_system",
                                    default=BeamSystemSettings(_mode=p.mode))
+        self.projection_system = p.model(ProjectionSystemSettings, self.projection_system, "projection_system",
+                                         default=ProjectionSystemSettings(_mode=p.mode))
+
+        # --- NEW PARSER ---
+        self.scan_system = p.model(ScanSystemSettings, self.scan_system, "scan_system",
+                                   default=ScanSystemSettings(_mode=p.mode))
+
         self.detector_system = p.model(DetectorSystemSettings, self.detector_system, "detector_system",
                                        default=DetectorSystemSettings(_mode=p.mode))
         self.info = p.model(SystemInfo, self.info, "info", default=SystemInfo(_mode=p.mode))
@@ -2530,6 +3359,8 @@ class SystemSettings:
         v = Validator(self, mode)
         v.check_nested(self.stage_system)
         v.check_nested(self.beam_system)
+        v.check_nested(self.projection_system)
+        v.check_nested(self.scan_system)  # <--- NEW CHECK
         v.check_nested(self.detector_system)
         v.check_nested(self.info)
         return v.valid
@@ -2546,19 +3377,16 @@ class SystemSettings:
 @dataclass
 class MicroscopeSettings:
     """
-    Root configuration for a microscope instance and its supported subsystems.
+    Root configuration for a microscope instance.
 
     Role:     Structure / Gateway
-    Context:  Both (Data-plane / Control-plane)
+    Context:  Control-plane
     Category: B (Structural Container)
 
     Attributes:
-        system (Optional[SystemSettings]): The hardware limits and registries.
-            None Behavior: Structural Default (Empty SystemSettings).
-        image (Optional[ImageOutputSettings]): Default save and naming settings.
-            None Behavior: Structural Default (Empty ImageOutputSettings).
-        protocol (Optional[dict]): High-level automation logic definitions.
-            None Behavior: Defaulted to a "demo" protocol dict.
+        system (Optional[SystemSettings]): Hardware limits and registries.
+        image (Optional[ImageOutputSettings]): Default output settings.
+        protocol (Optional[dict]): Automation scripts configuration.
     """
     system: Optional[SystemSettings] = None
     image: Optional[ImageOutputSettings] = None
@@ -2590,21 +3418,456 @@ class MicroscopeSettings:
 # =============================================================================
 
 @dataclass
+class StageMoveRequest:
+    """
+    Command to move the sample stage to a specific coordinate.
+
+    Role:     Intent (User Request)
+    Context:  Control-plane
+    Category: D (Tristate Intent)
+
+    Attributes:
+        target (Optional[StagePosition]): Destination coordinates.
+            None Behavior: Structural Default (Empty).
+        relative (Optional[bool]): If True, target is a delta.
+            None Behavior: Defaulted to False.
+        drive_type (Optional[str]): Mechanism ("mechanical", "piezo", "default").
+            None Behavior: Defaulted to "default".
+        backlash_correction (Optional[bool]): Apply anti-hysteresis.
+            None Behavior: Defaulted to True.
+        wait_for_settle (Optional[bool]): Block until vibration stops.
+            None Behavior: Defaulted to True.
+        settle_time (Optional[Quantity]): Override default wait. Units: s.
+            None Behavior: Preserved as None.
+    """
+    target: Optional[StagePosition] = None
+    relative: Optional[bool] = None
+    drive_type: Optional[str] = None  # Use StageDriveType values
+    backlash_correction: Optional[bool] = None
+    wait_for_settle: Optional[bool] = None
+    settle_time: Optional["Quantity"] = None
+    extra: Extras = field(default_factory=Extras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+
+    _UNITS = {"settle_time": Units.SEC}
+
+    def __post_init__(self):
+        p = FieldParser(self, self._mode, "StageMoveRequest")
+        self.relative = p.bool(self.relative, "relative", default=False)
+        self.drive_type = p.str(self.drive_type, "drive_type", default=StageDriveType.DEFAULT.value)
+        self.backlash_correction = p.bool(self.backlash_correction, "backlash_correction", default=True)
+        self.wait_for_settle = p.bool(self.wait_for_settle, "wait_for_settle", default=True)
+        self.settle_time = p.qty(self.settle_time, "settle_time", Units.SEC)
+        self.target = p.model(StagePosition, self.target, "target", default=StagePosition(_mode=p.mode))
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        v = Validator(self, mode)
+        v.check_nested(self.target)
+
+        # Check emptiness of target
+        axes = [self.target.x, self.target.y, self.target.z, self.target.r, self.target.tilt_x, self.target.tilt_y]
+        v.check(any(a is not None for a in axes), "empty", "StageMoveRequest has no target coordinates")
+
+        if self.drive_type == StageDriveType.PIEZO.value and self.relative:
+            # Heuristic: Warn if requesting massive moves (> 5um) on Piezo
+            # This prevents accidental "Piezo Saturation"
+            limit_nm = 5000.0
+            for axis in ['x', 'y', 'z']:
+                val = getattr(self.target, axis)
+                if val is not None:
+                    mag = abs(val.to(Units.NM).magnitude)
+                    v.check(mag < limit_nm, f"piezo_limit.{axis}",
+                            f"Piezo request {mag}nm exceeds typical range ({limit_nm}nm)")
+
+        v.check_ge_zero(self.settle_time, "settle_time", unit_aware=True, reset_to=None)
+        return v.valid
+
+    def to_dict(self) -> dict:
+        return _auto_to_dict(self, unit_map=self._UNITS)
+
+    @staticmethod
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "StageMoveRequest":
+        return _auto_from_dict(StageMoveRequest, d, mode, alias_map={
+            "settle_time": "settle_time_s"
+        })
+
+@dataclass
+class StageControlRequest:
+    """
+    Command to alter stage motor state (Stop, Home, Reset).
+
+    Role:     Intent (User Request)
+    Context:  Control-plane
+    Category: D (Intent)
+
+    Attributes:
+        action (Optional[str]): "STOP", "ABORT", "HOME", "RESET_ERROR".
+            None Behavior: Validation Error (Mandatory).
+        axes (Optional[List[str]]): Specific axes to target (e.g. ["x"]).
+            None Behavior: Applies to ALL axes.
+    """
+    action: Optional[str] = None
+    axes: Optional[List[str]] = None
+    extra: Extras = field(default_factory=Extras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+
+    def __post_init__(self):
+        p = FieldParser(self, self._mode, "StageControlRequest")
+        self.action = p.str(self.action, "action")
+        self.axes = p.list_str(self.axes, "axes")
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        v = Validator(self, mode)
+
+        # 1. Action is mandatory
+        valid_actions = {"STOP", "ABORT", "HOME", "RESET_ERROR", "ZERO_ENCODERS"}
+        v.check(self.action in valid_actions, "action",
+                f"Action must be one of {valid_actions}")
+
+        # 2. Axes validation (if provided)
+        if self.axes:
+            valid_axes = {"x", "y", "z", "r", "tilt_x", "tilt_y"}
+            for axis in self.axes:
+                v.check(axis in valid_axes, f"axes.{axis}", f"Invalid axis '{axis}'")
+
+        return v.valid
+
+    def to_dict(self) -> dict:
+        return _auto_to_dict(self)
+
+    @staticmethod
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "StageControlRequest":
+        return _auto_from_dict(StageControlRequest, d, mode)
+
+@dataclass
+class DetectorControlRequest:
+    """
+    Command to configure detector hardware (Temp, Insert) without acquisition.
+
+    Role:     Intent (User Request)
+    Context:  Control-plane
+    Category: D (Intent)
+
+    Attributes:
+        detector_id (Optional[str]): Target device ID.
+            None Behavior: Required if not in target.
+        target (Optional[DetectorSettings]): Configuration parameters to apply.
+            None Behavior: Structural Default (Empty).
+        action (Optional[str]): Mechanical cmd ("INSERT", "RETRACT", "COOLDOWN").
+            None Behavior: Preserved as None.
+    """
+    detector_id: Optional[str] = None
+    target: Optional[DetectorSettings] = None
+    action: Optional[str] = None
+    extra: Extras = field(default_factory=Extras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+
+    def __post_init__(self):
+        p = FieldParser(self, self._mode, "DetectorControlRequest")
+        self.detector_id = p.id(self.detector_id, "detector_id")
+        self.target = p.model(DetectorSettings, self.target, "target", default=DetectorSettings(_mode=p.mode))
+        self.action = p.str(self.action, "action")
+
+        # Sync: If settings has an ID but request doesn't, bubble it up
+        if self.target.detector_id and not self.detector_id:
+            self.detector_id = self.target.detector_id
+        # Sync: If request has ID, push it down to settings for consistency
+        elif self.detector_id and not self.target.detector_id:
+            self.target.detector_id = self.detector_id
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        v = Validator(self, mode)
+        v.check(bool(self.detector_id), "detector_id", "detector_id is required")
+        v.check_nested(self.target)
+
+        # Logic Check: Ensure we are doing *something*
+        # 1. Check if settings has any non-None fields (Intent)
+        has_settings_intent = False
+        for f in dataclasses.fields(self.target):
+            # Ignore internal fields and the ID itself (which is just identity, not a change)
+            if f.name not in ["extra", "_mode", "detector_id"] and getattr(self.target, f.name) is not None:
+                has_settings_intent = True
+                break
+
+        # 2. Check if action is present
+        has_action = self.action is not None
+
+        v.check(has_settings_intent or has_action, "empty_intent",
+                "Request must have either settings to apply or an action to execute")
+
+        if self.action:
+            valid_actions = {"INSERT", "RETRACT", "COOLDOWN", "WARMUP", "RESET"}
+            v.check(self.action in valid_actions, "action",
+                    f"Action must be one of {valid_actions}")
+
+        return v.valid
+
+    def to_dict(self) -> dict:
+        return _auto_to_dict(self)
+
+    @staticmethod
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "DetectorControlRequest":
+        return _auto_from_dict(DetectorControlRequest, d, mode)
+
+@dataclass
+class BeamControlRequest:
+    """
+    Command to change optical parameters (Voltage, Mode, Spot Size).
+
+    Role:     Intent (User Request)
+    Context:  Control-plane
+    Category: D (Intent)
+
+    Attributes:
+        target (Optional[BeamSettings]): The desired beam configuration.
+            None Behavior: Validation Error (Mandatory).
+    """
+    target: Optional[BeamSettings] = None
+    extra: Extras = field(default_factory=Extras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+
+    def __post_init__(self):
+        p = FieldParser(self, self._mode, "BeamControlRequest")
+        self.target = p.model(BeamSettings, self.target, "target", default=BeamSettings(_mode=p.mode))
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        v = Validator(self, mode)
+        v.check_nested(self.target)
+
+        # Check for empty intent
+        has_intent = False
+        for f in dataclasses.fields(self.target):
+            if f.name not in ["extra", "_mode"] and getattr(self.target, f.name) is not None:
+                has_intent = True
+                break
+
+        v.check(has_intent, "empty_target", "Beam request has no parameters set")
+        return v.valid
+
+    def to_dict(self) -> dict:
+        return _auto_to_dict(self)
+
+    @staticmethod
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "BeamControlRequest":
+        return _auto_from_dict(BeamControlRequest, d, mode)
+
+@dataclass
+class ProjectionControlRequest:
+    """
+    Command to change imaging parameters (Defocus, Mag, Shifts).
+
+    Role:     Intent (User Request)
+    Context:  Control-plane
+    Category: D (Intent)
+
+    Attributes:
+        target (Optional[ProjectionSettings]): The desired optical configuration.
+            None Behavior: Validation Error (Mandatory).
+    """
+    target: Optional[ProjectionSettings] = None
+    extra: Extras = field(default_factory=Extras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+
+    def __post_init__(self):
+        p = FieldParser(self, self._mode, "ProjectionControlRequest")
+        self.target = p.model(ProjectionSettings, self.target, "target", default=ProjectionSettings(_mode=p.mode))
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        v = Validator(self, mode)
+        v.check_nested(self.target)
+
+        # Check for empty intent
+        has_intent = False
+        for f in dataclasses.fields(self.target):
+            if f.name not in ["extra", "_mode"] and getattr(self.target, f.name) is not None:
+                has_intent = True
+                break
+
+        v.check(has_intent, "empty_target", "Projection request has no parameters set")
+
+        # Specific Logic: If switching to DIFFRACTION, you must provide a camera length
+        if self.target.optical_mode == "DIFFRACTION":
+            v.check(self.target.camera_length is not None, "missing_cam_len",
+                    "Switching to Diffraction requires a camera_length")
+
+        return v.valid
+
+    def to_dict(self) -> dict:
+        return _auto_to_dict(self)
+
+    @staticmethod
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "ProjectionControlRequest":
+        return _auto_from_dict(ProjectionControlRequest, d, mode)
+
+@dataclass
+class ScanControlRequest:
+    """
+    Command to control the STEM raster engine state.
+
+    Role:     Intent (User Request)
+    Context:  Control-plane
+    Category: D (Intent)
+
+    Attributes:
+        action (Optional[str]): "START", "STOP", "SINGLE_FRAME".
+            None Behavior: Validation Error (Mandatory).
+        target (Optional[ScanSettings]): Parameters to apply if starting.
+            None Behavior: Validation Error if action is START.
+    """
+    action: Optional[str] = None  # "START", "STOP", "SINGLE_FRAME"
+    target: Optional[ScanSettings] = None
+    extra: Extras = field(default_factory=Extras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+
+    def __post_init__(self):
+        # Renamed from ScanRequest to ScanControlRequest
+        p = FieldParser(self, self._mode, "ScanControlRequest")
+        self.action = p.str(self.action, "action")
+        self.target = p.model(ScanSettings, self.target, "target", default=ScanSettings(_mode=p.mode))
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        v = Validator(self, mode)
+        # 1. Action is mandatory
+        v.check(self.action in {"START", "STOP", "SINGLE_FRAME"}, "action",
+                "Action must be START, STOP, or SINGLE_FRAME")
+
+        # 2. Settings required if Starting
+        if self.action in {"START", "SINGLE_FRAME"}:
+            v.check_nested(self.target)
+
+        return v.valid
+
+    def to_dict(self) -> dict:
+        return _auto_to_dict(self)
+
+    @staticmethod
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "ScanControlRequest":
+        return _auto_from_dict(ScanControlRequest, d, mode)
+
+@dataclass
+class VacuumControlRequest:
+    """
+    Command to change valve or pump states.
+
+    Role:     Intent (User Request)
+    Context:  Control-plane
+    Category: D (Intent)
+
+    Attributes:
+        target (Optional[VacuumSettings]): Desired valve/pump states.
+            None Behavior: Validation Error (Mandatory).
+        force (Optional[bool]): Bypass software pressure checks.
+            None Behavior: Defaulted to False.
+    """
+    target: Optional[VacuumSettings] = None
+    force: Optional[bool] = None  # If True, bypasses some software soft-checks (use with caution)
+    extra: Extras = field(default_factory=Extras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+
+    def __post_init__(self):
+        p = FieldParser(self, self._mode, "VacuumControlRequest")
+        self.target = p.model(VacuumSettings, self.target, "target", default=VacuumSettings(_mode=p.mode))
+        self.force = p.bool(self.force, "force", default=False)
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        v = Validator(self, mode)
+        v.check_nested(self.target)
+
+        # Ensure at least one valve/pump state is being requested
+        has_intent = (self.target.column_valve_state is not None or
+                      self.target.gun_valve_state is not None or
+                      self.target.turbo_pump_state is not None)
+
+        v.check(has_intent, "empty_target", "Request must specify at least one state change")
+        return v.valid
+
+    def to_dict(self) -> dict:
+        return _auto_to_dict(self)
+
+    @staticmethod
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "VacuumControlRequest":
+        return _auto_from_dict(VacuumControlRequest, d, mode)
+
+@dataclass
+class ApertureControlRequest:
+    """
+    Command to modify an aperture's position or size.
+
+    Role:     Intent (User Request)
+    Context:  Control-plane
+    Category: D (Intent)
+
+    Attributes:
+        aperture_id (Optional[str]): Mechanism to target.
+            None Behavior: Required.
+        target (Optional[Aperture]): Desired configuration.
+            None Behavior: Structural Default (Empty).
+        relative (Optional[bool]): If True, position is a delta.
+            None Behavior: Defaulted to False.
+    """
+    aperture_id: Optional[str] = None
+    target: Optional[Aperture] = None
+    relative: Optional[bool] = None
+    extra: Extras = field(default_factory=Extras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+
+    def __post_init__(self):
+        p = FieldParser(self, self._mode, "ApertureControlRequest")
+        self.aperture_id = p.id(self.aperture_id, "aperture_id")
+        self.relative = p.bool(self.relative, "relative", default=False)
+        self.target = p.model(Aperture, self.target, "target", default=Aperture(_mode=p.mode))
+        if self.aperture_id is None and self.target.aperture_id is not None:
+            self.aperture_id = self.target.aperture_id
+        elif self.target.aperture_id is None and self.aperture_id is not None:
+            self.target.aperture_id = self.aperture_id
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        v = Validator(self, mode)
+        v.check(bool(self.aperture_id), "aperture_id", "aperture_id is required")
+        v.check_nested(self.target)
+
+        # ID Mismatch
+        if self.target.aperture_id and self.aperture_id and self.target.aperture_id != self.aperture_id:
+            v.check(False, "id_mismatch",
+                    f"Ambiguous IDs: '{self.aperture_id}' vs '{self.target.aperture_id}'",
+                    heal=lambda: setattr(self.target, 'aperture_id', self.aperture_id))
+
+        # Relative logic check
+        if self.relative:
+            v.check(self.target.position is not None, "relative_no_pos", "Relative mode requires a position vector")
+
+        # No-Op Check
+        has_intent = (
+                self.target.inserted is not None or self.target.size_index is not None or self.target.position is not None)
+        v.check(has_intent, "empty_payload", "Request contains no changes")
+
+        return v.valid
+
+    def to_dict(self) -> dict:
+        return _auto_to_dict(self)
+
+    @staticmethod
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "ApertureControlRequest":
+        return _auto_from_dict(ApertureControlRequest, d, mode, alias_map={
+            "state": "aperture"
+        })
+
+@dataclass
 class AcquisitionRequest:
     """
-    High-level intent to capture an image using a specific detector and settings.
+    Intent to capture an image using a specific detector.
 
     Role:     Intent (User Request)
     Context:  Control-plane
     Category: B / D (Structure / Intent)
 
     Attributes:
-        detector_id (Optional[str]): Targeted hardware device for capture.
-            None Behavior: Preserved as None; syncs with inner DetectorSettings.
-        detector (Optional[DetectorSettings]): Detailed camera parameters.
-            None Behavior: Structural Default (Empty DetectorSettings).
-        image (Optional[ImageOutputSettings]): Specific overrides for saving this image.
-            None Behavior: Structural Default (Empty ImageOutputSettings).
+        detector_id (Optional[str]): Target hardware device.
+            None Behavior: Required (can be inferred from detector).
+        detector (Optional[DetectorSettings]): Acquisition parameters.
+            None Behavior: Structural Default (Empty).
+        image (Optional[ImageOutputSettings]): Output file overrides.
+            None Behavior: Structural Default (Empty).
     """
     detector_id: Optional[str] = None
     detector: Optional[DetectorSettings] = None
@@ -2642,121 +3905,4 @@ class AcquisitionRequest:
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "AcquisitionRequest":
         return _auto_from_dict(AcquisitionRequest, d, mode)
-
-@dataclass
-class StageMoveRequest:
-    """
-    A specific command to move the sample stage.
-
-    Role:     Intent (User Request)
-    Context:  Control-plane
-    Category: D (Tristate Intent)
-
-    Attributes:
-        target (Optional[StagePosition]): The destination coordinates.
-            None Behavior: Structural Default (Empty StagePosition).
-        relative (Optional[bool]): If True, 'target' is a delta, not an absolute.
-            None Behavior: Defaulted to False for safety.
-    """
-    target: Optional[StagePosition] = None
-    relative: Optional[bool] = None
-    backlash_correction: Optional[bool] = None
-    wait_for_settle: Optional[bool] = None
-    settle_time: Optional["Quantity"] = None
-    extra: Extras = field(default_factory=Extras)
-    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
-
-    _UNITS = {"settle_time": Units.SEC}
-
-    def __post_init__(self):
-        p = FieldParser(self, self._mode, "StageMoveRequest")
-        self.relative = p.bool(self.relative, "relative", default=False)
-        self.backlash_correction = p.bool(self.backlash_correction, "backlash_correction", default=True)
-        self.wait_for_settle = p.bool(self.wait_for_settle, "wait_for_settle", default=True)
-        self.settle_time = p.qty(self.settle_time, "settle_time", Units.SEC)
-        self.target = p.model(StagePosition, self.target, "target", default=StagePosition(_mode=p.mode))
-
-    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        v = Validator(self, mode)
-        v.check_nested(self.target)
-
-        # Check emptiness of target
-        axes = [self.target.x, self.target.y, self.target.z, self.target.r, self.target.tilt_x, self.target.tilt_y]
-        v.check(any(a is not None for a in axes), "empty", "StageMoveRequest has no target coordinates")
-
-        v.check_ge_zero(self.settle_time, "settle_time", unit_aware=True, reset_to=None)
-        return v.valid
-
-    def to_dict(self) -> dict:
-        return _auto_to_dict(self, unit_map=self._UNITS)
-
-    @staticmethod
-    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "StageMoveRequest":
-        return _auto_from_dict(StageMoveRequest, d, mode, alias_map={
-            "settle_time": "settle_time_s"
-        })
-
-@dataclass
-class ApertureControlRequest:
-    """
-    Intent to mechanically modify an aperture's state.
-
-    Role:     Intent (User Request)
-    Context:  Control-plane
-    Category: B / D (Structure / Intent)
-
-    Attributes:
-        aperture_id (Optional[str]): The mechanism to target (e.g., 'objective').
-            None Behavior: Required for execution.
-        state (Optional[Aperture]): The desired configuration changes.
-            None Behavior: Structural Default (Empty Aperture object).
-        relative (Optional[bool]): If True, position coordinates are treated as a delta.
-            None Behavior: Defaulted to False.
-    """
-    aperture_id: Optional[str] = None
-    state: Optional[Aperture] = None
-    relative: Optional[bool] = None
-    extra: Extras = field(default_factory=Extras)
-    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
-
-    def __post_init__(self):
-        p = FieldParser(self, self._mode, "ApertureControlRequest")
-        self.aperture_id = p.id(self.aperture_id, "aperture_id")
-        self.relative = p.bool(self.relative, "relative", default=False)
-        self.state = p.model(Aperture, self.state, "state", default=Aperture(_mode=p.mode))
-        if self.aperture_id is None and self.state.aperture_id is not None:
-            self.aperture_id = self.state.aperture_id
-        elif self.state.aperture_id is None and self.aperture_id is not None:
-            self.state.aperture_id = self.aperture_id
-
-    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        v = Validator(self, mode)
-        v.check(bool(self.aperture_id), "aperture_id", "aperture_id is required")
-        v.check_nested(self.state)
-
-        # ID Mismatch
-        if self.state.aperture_id and self.aperture_id and self.state.aperture_id != self.aperture_id:
-            v.check(False, "id_mismatch",
-                    f"Ambiguous IDs: '{self.aperture_id}' vs '{self.state.aperture_id}'",
-                    heal=lambda: setattr(self.state, 'aperture_id', self.aperture_id))
-
-        # Relative logic check
-        if self.relative:
-            v.check(self.state.position is not None, "relative_no_pos", "Relative mode requires a position vector")
-
-        # No-Op Check
-        has_intent = (
-                self.state.inserted is not None or self.state.size_index is not None or self.state.position is not None)
-        v.check(has_intent, "empty_payload", "Request contains no changes")
-
-        return v.valid
-
-    def to_dict(self) -> dict:
-        return _auto_to_dict(self)
-
-    @staticmethod
-    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "ApertureControlRequest":
-        return _auto_from_dict(ApertureControlRequest, d, mode, alias_map={
-            "state": "aperture"
-        })
 

@@ -642,7 +642,7 @@ class SafetyCheck:
 def _jsonable(obj: Any) -> Any:
     """Recursively convert object to JSON-safe primitives."""
     if obj is None or isinstance(obj, (str, int, float, bool)): return obj
-    if isinstance(obj, (list, tuple)): return [_jsonable(x) for x in obj]
+    if isinstance(obj, (list, tuple, set)): return [_jsonable(x) for x in obj]
     if isinstance(obj, dict): return {str(k): _jsonable(v) for k, v in obj.items()}
     if isinstance(obj, Quantity): return {"magnitude": float(obj.magnitude), "unit": str(obj.units)}
     try:
@@ -656,13 +656,20 @@ def _jsonable(obj: Any) -> Any:
 def note_or_raise(extra: Optional[Extras], key: str, exc: Exception, *, mode: Union[ParseMode, str],
                   raw: Any = None) -> None:
     """Handle validation error based on Strict/Lenient mode."""
-    if as_parse_mode(mode) == ParseMode.STRICT: raise exc
-    if extra is None: return
-    try:
-        if raw is not None: extra.raw[key] = _jsonable(raw)
-        extra.notes.setdefault(key, []).append({"error": str(exc), "type": type(exc).__name__})
-    except Exception:
-        pass
+    if as_parse_mode(mode) == ParseMode.STRICT:
+        raise exc
+
+    if extra is None:
+        return
+
+    if raw is not None:
+        try:
+            extra.raw[key] = _jsonable(raw)
+        except Exception as e:
+            # If raw serialization fails, just record string rep
+            extra.raw[key] = str(raw)
+
+    extra.notes.setdefault(key, []).append({"error": str(exc), "type": type(exc).__name__})
 
 def _extra_put_raw(extra: Any, key: str, value: Any) -> None:
     if extra is None: return
@@ -1033,6 +1040,8 @@ class FieldParser:
             self._record(name, val, TypeError(f"{name} must be dict, got {type(val).__name__}"))
             return out
         for k, v in val.items():
+            if v is None:
+                continue
             key_norm = self.id(k, f"{name}.key")
             if key_norm is None: continue
 
@@ -1041,13 +1050,8 @@ class FieldParser:
 
             if obj is None:
                 self._record(obj_key, v, TypeError(f"Invalid object for key '{key_norm}'"))
-                if not self.strict:
-                    try:
-                        obj = cls(_mode=self.mode)  # type: ignore
-                    except:
-                        pass
 
-            if obj is not None:
+            else:
                 if id_field and hasattr(obj, id_field):
                     internal_id = getattr(obj, id_field, None)
                     if internal_id is None:
@@ -1187,7 +1191,7 @@ def _auto_to_dict(obj: Any, unit_map: Dict[str, str] = None, key_map: Dict[str, 
 
         # 1. Happy Path: Field is in _UNITS
         if target_unit:
-            key = f"{key}_{target_unit}" if name not in key_map else key
+            key = f"{key}_{target_unit.lower()}" if name not in key_map else key
             try:
                 # Try strict conversion
                 if isinstance(val, (list, tuple)):
@@ -1592,9 +1596,9 @@ class StageSystemSettings:
         p = FieldParser(self, self._mode, "StageSystemSettings")
         # Category A: Apply Defaults (Booleans)
         self.enabled = p.bool(self.enabled, "enabled", default=True)
-        self.can_x = p.bool(self.can_x, "can_x", default=True)
-        self.can_y = p.bool(self.can_y, "can_y", default=True)
-        self.can_z = p.bool(self.can_z, "can_z", default=True)
+        self.can_x = p.bool(self.can_x, "can_x", default=False)
+        self.can_y = p.bool(self.can_y, "can_y", default=False)
+        self.can_z = p.bool(self.can_z, "can_z", default=False)
         self.can_r = p.bool(self.can_r, "can_r", default=False)
         self.can_tilt_x = p.bool(self.can_tilt_x, "can_tilt_x", default=False)
         self.can_tilt_y = p.bool(self.can_tilt_y, "can_tilt_y", default=False)
@@ -1963,7 +1967,7 @@ class ProjectionSettings:
     Attributes:
         optical_mode (Optional[str]): Active lens program (e.g. "IMAGING", "DIFFRACTION").
             None Behavior: Snapshot (Unknown) | Intent (No Change).
-        magnification_index (Optional[int]): Discrete step index for mag.
+        magnification (Optional[int]): Magnification.
             None Behavior: Snapshot (Unknown) | Intent (No Change).
         defocus (Optional[Quantity]): Deviation from focus. Units: nm.
             None Behavior: Snapshot (Unknown) | Intent (No Change).
@@ -1987,7 +1991,7 @@ class ProjectionSettings:
     optical_mode: Optional[str] = None  # "IMAGING", "DIFFRACTION", "LAD"
 
     # Imaging Parameters (IMAGING mode)
-    magnification_index: Optional[int] = None
+    magnification: Optional[int] = None
     defocus: Optional["Quantity"] = None
     objective_stigmation: Optional[Point] = None
     image_shift: Optional[Point] = None
@@ -2009,7 +2013,7 @@ class ProjectionSettings:
     def __post_init__(self):
         p = FieldParser(self, self._mode, "ProjectionSettings")
         self.optical_mode = p.str(self.optical_mode, "optical_mode")
-        self.magnification_index = p.int(self.magnification_index, "magnification_index")
+        self.magnification = p.int(self.magnification, "magnification")
         self.defocus = p.qty(self.defocus, "defocus", Units.NM)
         self.camera_length = p.qty(self.camera_length, "camera_length", Units.MM)
         self.screen_position = p.str(self.screen_position, "screen_position")
@@ -2026,7 +2030,7 @@ class ProjectionSettings:
 
         # --- NEW VALIDATION LOGIC ---
         v.check_ge_zero(self.camera_length, "camera_length", unit_aware=True, reset_to=None)
-        v.check_ge_zero(self.magnification_index, "magnification_index", reset_to=None)
+        v.check_ge_zero(self.magnification, "magnification", reset_to=None)
 
         if self.screen_position:
             v.check(self.screen_position in {"UP", "DOWN"}, "screen_position",
@@ -2120,10 +2124,10 @@ class ProjectionSystemSettings:
                 reasons.append(f"Defocus {target.defocus} outside limits {self.defocus_limits}")
 
         # Check Mag Limits
-        if target.magnification_index is not None and self.magnification_limits:
+        if target.magnification is not None and self.magnification_limits:
             mn, mx = self.magnification_limits
-            if not (mn <= target.magnification_index <= mx):
-                reasons.append(f"Mag index {target.magnification_index} outside limits {self.magnification_limits}")
+            if not (mn <= target.magnification <= mx):
+                reasons.append(f"Magnification {target.magnification} outside limits {self.magnification_limits}")
 
         return SafetyCheck(allowed=(len(reasons) == 0), reasons=reasons)
 
@@ -2559,20 +2563,20 @@ class DetectorSystemSettings:
                     f"Default '{self.default_detector_id}' is unknown",
                     heal=lambda: setattr(self, 'default_detector_id', None))
 
-            # 2. Completeness (Heal by removing the broken ID from availability)
-            def _heal_missing(missing_set):
-                # Remove the IDs that have no config from the available list
-                self.available_detector_ids = [x for x in self.available_detector_ids if x not in missing_set]
+        # 2. Completeness (Heal by removing the broken ID from availability)
+        def _heal_missing(missing_set):
+            # Remove the IDs that have no config from the available list
+            self.available_detector_ids = [x for x in self.available_detector_ids if x not in missing_set]
 
-            missing_defaults = ids_available - set(self.defaults_by_id.keys())
-            v.check(not missing_defaults, "completeness.defaults",
-                    f"Missing defaults for: {missing_defaults}",
-                    heal=lambda: _heal_missing(missing_defaults))
+        missing_defaults = ids_available - set(self.defaults_by_id.keys())
+        v.check(not missing_defaults, "completeness.defaults",
+                f"Missing defaults for: {missing_defaults}",
+                heal=lambda: _heal_missing(missing_defaults))
 
-            missing_caps = ids_available - set(self.capabilities_by_id.keys())
-            v.check(not missing_caps, "completeness.capabilities",
-                    f"Missing capabilities for: {missing_caps}",
-                    heal=lambda: _heal_missing(missing_caps))
+        missing_caps = ids_available - set(self.capabilities_by_id.keys())
+        v.check(not missing_caps, "completeness.capabilities",
+                f"Missing capabilities for: {missing_caps}",
+                heal=lambda: _heal_missing(missing_caps))
 
         # 3. Recursive Checks
         v.check_nested_map(self.defaults_by_id)

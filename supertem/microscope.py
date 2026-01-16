@@ -15,54 +15,139 @@ I. The Three-Layer Architecture
 To ensure safety and consistency across different hardware vendors, this class
 enforces a strict separation of concerns via three distinct execution layers:
 
-  1) The Atomic Layer (Abstract - Vendor Implemented)
+  1) The Atomic Layer (The "Hands" - Abstract & Vendor Implemented)
      - Role: Direct, unbuffered hardware I/O.
-     - Responsibility: Translate a typed value (e.g., `10 nm`) into the specific
-       serial/network command required by the microscope column.
-     - Safety: BLIND. It performs no logic or safety checks. It just executes.
-     - Signature: `set_spot_size(int)`, `set_defocus(Quantity)`.
+     - Responsibility: Dumb I/O. If asked to set an unsafe value (e.g. index 99),
+       it attempts it without second-guessing.
+     - Behavior:
+        - READ (Getters): "Null means Unknown". Returns `None` on failure, never defaults.
+        - WRITE (Setters): "Fail Loudly". Raises exceptions if hardware rejects the command.
+          *Rule:* Do NOT swallow hardware errors (IOError, Timeout) in this layer.
 
-  2) The Helper Layer (Concrete - Framework Provided)
-     - Role: Bulk application and State management.
-     - Responsibility: Unpack `Settings` objects (e.g., `BeamSettings`) and
-       route non-None fields to the appropriate Atomic setters.
-     - Safety: LOGICAL. Ensures units are correct but assumes values are safe.
-     - Signature: `apply_beam_settings(settings)`.
+  2) The Helper Layer (The "Brain" - Vendor Overridden)
+     - Role: Bulk application, Unpacking, and **Vendor Validation**.
+     - Responsibility:
+       a. Routes canonical physics (e.g. `voltage`) to atomic setters.
+       b. **Vendor Guard:** Extracts vendor-specific keys from `Extras` (e.g. registers,
+          indices), validates them against hardware limits, and RAISES error if invalid.
+       c. Prevents invalid vendor data from reaching the Atomic layer.
+     - Behavior:
+       - **Validation:** Enforces vendor-specific safety logic (raises ValueError).
+       - **Pass-Through:** Does NOT catch hardware errors. If the Atomic layer explodes
+         (e.g., IOError), the Helper layer MUST let the exception bubble up.
 
-  3) The Orchestrator Layer (Concrete - Framework Provided)
-     - Role: The Control Plane Interface / Gatekeeper.
+  3) The Orchestrator Layer (The "Gatekeeper" - Framework Provided)
+     - Role: The Control Plane Interface.
      - Responsibility:
        a. Validate the Intent (`request.validate()`).
-       b. Check Hardware Capabilities (`system.is_safe_...`).
-       c. Interpolate/Sequence complex moves (e.g., Step-limited stage movement).
-       d. Delegate to Helpers/Atomic methods for execution.
-     - Safety: STRICT. This is the only public entry point for automation scripts.
-     - Signature: `execute_stage_move(request)`, `execute_beam_control(request)`.
+       b. Check Canonical Hardware Capabilities (`system.is_safe_...`).
+       c. Delegate to Helpers/Atomic methods for execution.
+     - Behavior:
+       - **Strict Safety:** Raises `RuntimeError` or `ValueError` to prevent unsafe moves.
+       - **Bubble Up:** Does NOT catch hardware errors. If the Atomic/Helper layers explode,
+         the Orchestrator lets the exception pass through to the user script.
 
 ===============================================================================
 II. The Safety & Validation Contract
 ===============================================================================
 
-Drivers inheriting from `TemMicroscope` rely on the base class to handle safety.
-The `Orchestrator` methods guarantee that by the time an Atomic method is called:
+Safety is handled via a "Dual-Gatekeeper" model:
 
-  1) Structural Integrity is verified (via `base.py` Strict Parsing).
-  2) Logical Integrity is verified (via `request.validate()`).
-  3) Physical Safety is verified (via `SystemSettings` limits).
+  A. Canonical Safety (Handled by Orchestrator)
+     The base class Orchestrator validates standard physical properties against
+     `SystemSettings` limits (e.g., Voltage, Stage Limits).
+     *Result:* Safe canonical values reach the Helper layer.
 
-  *Driver Developer Note:* Do not re-implement safety checks in Atomic methods
-  unless they are hardware-critical firmware interlocks. Rely on the
-  `Orchestrator` to filter unsafe requests.
+  B. Vendor Safety (Handled by Helper Overrides)
+     The Orchestrator CANNOT validate vendor-specific `Extras`. The Vendor Driver
+     MUST override Helper methods (e.g. `apply_beam_settings`) to validate these.
+     *Result:* The driver refuses to pass invalid indices to the Atomic layer.
 
 ===============================================================================
-III. Type Safety & Units
+III. Data Integrity & Parse Modes
 ===============================================================================
 
-All Atomic interfaces use strict typing:
-  - `Quantity` (from pint) is used for all physical values.
-  - `int` / `str` / `bool` are used for discrete states.
-  - Vendor drivers must handle unit conversion (e.g., converting the input
-    `10 nm` to the `1e-8 meters` expected by a specific API).
+Drivers must implement the "Ingress/Egress" policy using `base.py` ParseModes:
+
+  A. Egress (Control Plane / Writing to Hardware) -> ParseMode.STRICT
+     - Context: `apply_...` methods and `move_stage...`.
+     - Rule: **Fail Fast.** If the input (canonical or vendor extra) is invalid
+       or unsafe, raise an Exception immediately. Do not coerce. Do not guess.
+
+  B. Ingress (Data Plane / Reading from Hardware) -> ParseMode.LENIENT
+     - Context: `get_...` methods and `acquire_image`.
+     - Rule: **Survive.** If hardware returns malformed data (e.g., NaN vacuum),
+       coerce it to `None` or a safe default. Do not crash the logging loop.
+     - Implementation: Wrap Atomic Getters in try/except blocks that return `None`.
+
+  *Exception:* Critical navigation data (e.g., Stage Position) may use STRICT
+  mode on Ingress if corrupted data poses a physical collision risk.
+
+===============================================================================
+IV. Type Safety & Return Policy
+===============================================================================
+
+To balance Safety (Control Logic) with Accuracy (Physics), this interface enforces
+a strict return type policy for Atomic Getters:
+
+  A. Measurements (Optional Objects) -> Return `None` on Failure
+     - Types: `Quantity`, `int` (indices), `StagePosition`, `ROI`.
+     - Logic: `None` implies "Unknown". Zero is a valid physical value.
+     - Example: `get_pressure() -> None` (Sensor offline).
+     - Signature: `def get_x(self) -> Optional[Type]`
+
+  B. Discrete States (Strict Primitives) -> Return Sentinel on Failure
+     - Types: `str`, `bool`.
+     - Logic: Return `"UNKNOWN"` or `False` to ensure control flow safety.
+       Allows logic like `if get_mode() == "TEM"` to fail gracefully rather than crashing.
+     - Example: `get_mode() -> "UNKNOWN"`, `get_beam_blank() -> False`.
+     - Signature: `def get_x(self) -> str` (No Optional)
+
+===============================================================================
+V. Logging Strategy (Intent vs. IO)
+===============================================================================
+
+To maintain readability and traceability, drivers must strictly follow these
+logging rules:
+
+1. Layered Logging Levels
+   - **Orchestrator (INFO):** Logs high-level intent.
+     *Example:* `[STAGE] Executing Move: Target=(x=10um)...`
+   - **Helper (WARNING):** Logs safety interventions or clamps.
+     *Example:* `[BEAM] Spot Size 12 clamped to 5.`
+   - **Atomic (DEBUG):** Logs raw hardware I/O.
+     *Example:* `[PyJEM] Write: HT3.SetHtValue(200000)`
+
+2. Implementation Rules (Atomic Layer)
+   Drivers must implement Atomic methods using this specific pattern:
+
+   A. **Consistent Logging (Setters):**
+      Always log the value *before* the hardware call.
+      *Pattern:* `logger.debug(f"[{TAG}] Setting {Name}: {Value}")`
+
+   B. **Consistent Error Handling:**
+      - **Getters (Read):** Catch Exception -> Log DEBUG -> Return None.
+        *Reason:* "Null means Unknown". Logging as ERROR causes log spam during
+        high-frequency polling.
+        *Code:*
+          ```python
+          try:
+              return hardware.get_value()
+          except Exception as e:
+              logger.debug(f"[{TAG}] Read failed: {e}")
+              return None
+          ```
+
+      - **Setters (Write):** Catch Exception -> Log ERROR -> Raise.
+        *Reason:* "Fail Loudly". Writes change state; silent failure is dangerous.
+        *Code:*
+          ```python
+          try:
+              hardware.set_value(val)
+          except Exception as e:
+              logger.error(f"[{TAG}] Write failed: {e}")
+              raise
+          ```
 
 ===============================================================================
 Usage
@@ -196,10 +281,10 @@ class TemMicroscope(ABC):
     @abstractmethod
     def get_mode(self) -> str:
         """
-        Get the global instrument mode.
+        Get the global instrument mode. (Strict Primitive)
 
         Returns:
-            String: e.g., 'TEM', 'STEM', 'SEM', 'DIFF', 'EDX'.
+            String: 'TEM', 'STEM', or 'UNKNOWN' on failure.
         """
         pass
 
@@ -241,19 +326,26 @@ class TemMicroscope(ABC):
     # --- Atomic Layer (Abstract) ---
 
     @abstractmethod
-    def get_stage_position(self) -> StagePosition:
+    def get_stage_position(self) -> Optional[StagePosition]:
         """
         Atomic: Read current physical stage coordinates.
 
         Returns:
             StagePosition: Objects with x, y, z, r, tilt_x, tilt_y.
+            None: If hardware read fails.
         """
         pass
 
     @abstractmethod
-    def move_stage_absolute(self, target: StagePosition,
-                            drive_type: str = "default",
-                            wait: bool = True) -> None:
+    def move_stage_absolute(
+            self,
+            target: StagePosition,
+            drive_type: str = "default",
+            wait: bool = True,
+            tolerance_nm: float = 200.0,
+            tolerance_deg: float = 0.1,
+            max_retries: int = 3
+    ) -> None:
         """
         Atomic: Move stage to a specific absolute coordinate.
 
@@ -283,6 +375,8 @@ class TemMicroscope(ABC):
         Helper: Calculate absolute target from delta and execute move.
         """
         current = self.get_stage_position()
+        if current is None:
+            raise RuntimeError("Cannot perform relative move: Stage position is unknown.")
         target = current + delta  # Vector addition handled by StagePosition
         # We delegate to the safe mover to ensure step sizes are respected even for relative moves
         self.safe_move_stage(target, drive_type=drive_type, wait=wait)
@@ -300,11 +394,17 @@ class TemMicroscope(ABC):
         if not request.validate():
             raise ValueError(f"Invalid StageMoveRequest: {request}")
 
+        # LOG INTENT
+        tgt_str = f"Target={request.target}" if not request.relative else f"Delta={request.target}"
+        logger.info(f"[STAGE] Executing Move: {tgt_str} (Mode: {request.drive_type})")
+
         # 1. Resolve Target (Absolute)
         current = self.get_stage_position()
         target_abs = request.target
 
         if request.relative:
+            if current is None:
+                raise RuntimeError("Relative move failed: Current stage position is unknown.")
             target_abs = current + request.target
             # If absolute addition resulted in None for some axes, fill them from current
             # to allow for a complete safety check of the final destination.
@@ -321,6 +421,7 @@ class TemMicroscope(ABC):
                 relative=request.relative
             )
             if not check:
+                logger.error(f"[STAGE] Unsafe move rejected. Reasons: {check.reasons}")
                 raise RuntimeError(f"Unsafe move rejected: {check.reasons}")
 
             # 3. Execution (via Safe Mover)
@@ -337,6 +438,8 @@ class TemMicroscope(ABC):
         if not request.validate():
             raise ValueError(f"Invalid StageControlRequest: {request}")
 
+        logger.info(f"[STAGE] Executing Control: {request.action}")
+
         if request.action == "STOP":
             self.stop_stage()
         elif request.action == "HOME":
@@ -350,42 +453,42 @@ class TemMicroscope(ABC):
     # --- Atomic Getters (Abstract) ---
     @abstractmethod
     def get_acceleration_voltage(self) -> Optional[Quantity]:
-        """Get High Tension. Units: Electric Potential (kV)."""
+        """Get High Tension. Units: Electric Potential (kV). Returns None if unknown."""
         pass
 
     @abstractmethod
     def get_beam_current(self) -> Optional[Quantity]:
-        """Get Beam Current. Units: Electric Current (nA/pA)."""
+        """Get Beam Current. Units: Electric Current (nA/pA). Returns None if unknown."""
         pass
 
     @abstractmethod
-    def get_spot_size(self) -> int:
-        """Get Spot Size Index (unitless integer)."""
+    def get_spot_size(self) -> Optional[int]:
+        """Get Spot Size Index (unitless integer). Returns None if unknown."""
         pass
 
     @abstractmethod
     def get_convergence_angle(self) -> Optional[Quantity]:
-        """Get Convergence (Alpha) Angle. Units: Angle (mrad)."""
+        """Get Convergence (Alpha) Angle. Units: Angle (mrad). Returns None if unknown."""
         pass
 
     @abstractmethod
-    def get_beam_shift(self) -> Tuple[float, float]:
+    def get_beam_shift(self) -> Tuple[Optional[float], Optional[float]]:
         """Get Beam Shift Coils. Units: Logical (-1..1) or Physical (Arb)."""
         pass
 
     @abstractmethod
-    def get_condenser_stigmation(self) -> Tuple[float, float]:
+    def get_condenser_stigmation(self) -> Tuple[Optional[float], Optional[float]]:
         """Get Condenser Stigmator Coils. Units: Logical or Physical."""
         pass
 
     @abstractmethod
-    def get_gun_tilt(self) -> Tuple[float, float]:
+    def get_gun_tilt(self) -> Tuple[Optional[float], Optional[float]]:
         """Get Gun Tilt Alignment. Units: Logical or Physical."""
         pass
 
     @abstractmethod
     def get_beam_blank(self) -> bool:
-        """Get Beam Blank Status. True = Blanked (Beam OFF)."""
+        """Get Beam Blank Status. True = Blanked (Beam OFF). (Strict Primitive)"""
         pass
 
     # --- Atomic Setters (Abstract) ---
@@ -475,11 +578,13 @@ class TemMicroscope(ABC):
         if not request.validate():
             raise ValueError(f"Invalid BeamControlRequest: {request}")
 
-        # Safety Check
+        logger.info(f"[BEAM] Executing Control: Setting {list(request.target.__dict__.keys())}")
+
         sys = self.system_settings.beam_system
         if sys:
             check = sys.is_safe_beam(request.target)
             if not check:
+                logger.error(f"[BEAM] Unsafe settings rejected: {check.reasons}")
                 raise RuntimeError(f"Unsafe beam settings rejected: {check.reasons}")
 
         if request.target:
@@ -492,41 +597,41 @@ class TemMicroscope(ABC):
     # --- Atomic Getters ---
     @abstractmethod
     def get_projection_mode(self) -> str:
-        """Get optical mode (e.g., 'IMAGING', 'DIFFRACTION')."""
+        """Get optical mode (e.g., 'IMAGING', 'DIFFRACTION'). (Strict Primitive)"""
         pass
 
     @abstractmethod
-    def get_magnification_index(self) -> int:
-        """Get Magnification Index (unitless integer)."""
+    def get_magnification(self) -> Optional[int]:
+        """Get Magnification (unitless integer). Returns None if unknown."""
         pass
 
     @abstractmethod
     def get_camera_length(self) -> Optional[Quantity]:
-        """Get Camera Length (Diffraction). Units: Length (mm)."""
+        """Get Camera Length (Diffraction). Units: Length (mm). Returns None if unknown."""
         pass
 
     @abstractmethod
     def get_defocus(self) -> Optional[Quantity]:
-        """Get Defocus. Units: Length (nm)."""
+        """Get Defocus. Units: Length (nm). Returns None if unknown."""
         pass
 
     @abstractmethod
     def get_screen_position(self) -> str:
-        """Get Fluorescent Screen Position ('UP' or 'DOWN')."""
+        """Get Fluorescent Screen Position ('UP', 'DOWN', or 'UNKNOWN')."""
         pass
 
     @abstractmethod
-    def get_objective_stigmation(self) -> Tuple[float, float]:
+    def get_objective_stigmation(self) -> Tuple[Optional[float], Optional[float]]:
         """Get Objective Stigmator Coils (x, y)."""
         pass
 
     @abstractmethod
-    def get_image_shift(self) -> Tuple[float, float]:
+    def get_image_shift(self) -> Tuple[Optional[float], Optional[float]]:
         """Get Image Shift Coils (x, y)."""
         pass
 
     @abstractmethod
-    def get_diffraction_shift(self) -> Tuple[float, float]:
+    def get_diffraction_shift(self) -> Tuple[Optional[float], Optional[float]]:
         """Get Diffraction Shift Coils (x, y)."""
         pass
 
@@ -537,8 +642,8 @@ class TemMicroscope(ABC):
         pass
 
     @abstractmethod
-    def set_magnification_index(self, index: int) -> None:
-        """Set Magnification Index."""
+    def set_magnification(self, index: int) -> None:
+        """Set Magnification."""
         pass
 
     @abstractmethod
@@ -581,7 +686,7 @@ class TemMicroscope(ABC):
 
         return ProjectionSettings(
             optical_mode=self.get_projection_mode(),
-            magnification_index=self.get_magnification_index(),
+            magnification=self.get_magnification(),
             defocus=self.get_defocus(),
             camera_length=self.get_camera_length(),
             screen_position=self.get_screen_position(),
@@ -594,8 +699,8 @@ class TemMicroscope(ABC):
         """Helper: Applies partial projection settings."""
         if settings.optical_mode is not None:
             self.set_projection_mode(settings.optical_mode)
-        if settings.magnification_index is not None:
-            self.set_magnification_index(settings.magnification_index)
+        if settings.magnification is not None:
+            self.set_magnification(settings.magnification)
         if settings.camera_length is not None:
             self.set_camera_length(settings.camera_length)
         if settings.defocus is not None:
@@ -616,10 +721,13 @@ class TemMicroscope(ABC):
         if not request.validate():
             raise ValueError(f"Invalid ProjectionControlRequest: {request}")
 
+        logger.info("[PROJ] Executing Control Request")
+
         sys = self.system_settings.projection_system
         if sys:
             check = sys.is_safe_projection(request.target)
             if not check:
+                logger.error(f"[PROJ] Unsafe settings rejected: {check.reasons}")
                 raise RuntimeError(f"Unsafe projection settings rejected: {check.reasons}")
 
         if request.target:
@@ -632,37 +740,37 @@ class TemMicroscope(ABC):
     # --- Atomic Getters ---
     @abstractmethod
     def get_scan_mode(self) -> str:
-        """Get scan engine mode."""
+        """Get scan engine mode. (Strict Primitive)"""
         pass
 
     @abstractmethod
-    def get_scan_width(self) -> int:
-        """Get scan width in pixels."""
+    def get_scan_width(self) -> Optional[int]:
+        """Get scan width in pixels. Returns None if unknown."""
         pass
 
     @abstractmethod
-    def get_scan_height(self) -> int:
-        """Get scan height in pixels."""
+    def get_scan_height(self) -> Optional[int]:
+        """Get scan height in pixels. Returns None if unknown."""
         pass
 
     @abstractmethod
-    def get_scan_pixel_dwell(self) -> Quantity:
-        """Get pixel dwell time. Units: Time (us/ns)."""
+    def get_scan_pixel_dwell(self) -> Optional[Quantity]:
+        """Get pixel dwell time. Units: Time (us/ns). Returns None if unknown."""
         pass
 
     @abstractmethod
-    def get_scan_flyback(self) -> Quantity:
-        """Get flyback time. Units: Time (us/ns)."""
+    def get_scan_flyback(self) -> Optional[Quantity]:
+        """Get flyback time. Units: Time (us/ns). Returns None if unknown."""
         pass
 
     @abstractmethod
-    def get_scan_rotation(self) -> Quantity:
-        """Get scan rotation. Units: Angle (deg/rad)."""
+    def get_scan_rotation(self) -> Optional[Quantity]:
+        """Get scan rotation. Units: Angle (deg/rad). Returns None if unknown."""
         pass
 
     @abstractmethod
     def get_scan_active(self) -> bool:
-        """Return True if scanning is currently active."""
+        """Return True if scanning is currently active. (Strict Primitive)"""
         pass
 
     # --- Atomic Setters ---
@@ -727,12 +835,14 @@ class TemMicroscope(ABC):
         if not request.validate():
             raise ValueError(f"Invalid ScanControlRequest: {request}")
 
-        # Safety Check if applying new settings
+        logger.info(f"[SCAN] Executing Control: Action={request.action}")
+
         if request.target and request.action in ("START", "SINGLE_FRAME"):
             sys = self.system_settings.scan_system
             if sys:
                 check = sys.is_safe_scan(request.target)
                 if not check:
+                    logger.error(f"[SCAN] Unsafe settings rejected: {check.reasons}")
                     raise RuntimeError(f"Unsafe scan settings rejected: {check.reasons}")
             self.apply_scan_settings(request.target)
 
@@ -763,32 +873,33 @@ class TemMicroscope(ABC):
         pass
 
     @abstractmethod
-    def get_detector_exposure(self, detector_id: str) -> Quantity:
-        """Get exposure time. Units: Time (s/ms)."""
+    def get_detector_exposure(self, detector_id: str) -> Optional[Quantity]:
+        """Get exposure time. Units: Time (s/ms). Returns None if unknown."""
         pass
 
     @abstractmethod
-    def get_detector_binning(self, detector_id: str) -> int:
-        """Get binning index (e.g., 1 for 1x1, 2 for 2x2)."""
+    def get_detector_binning(self, detector_id: str) -> Optional[int]:
+        """Get binning index (e.g., 1 for 1x1, 2 for 2x2). Returns None if unknown."""
         pass
 
     @abstractmethod
     def get_detector_roi(self, detector_id: str) -> Optional[ROI]:
-        """Get Region of Interest."""
+        """Get Region of Interest. Returns None if unknown."""
         pass
 
     @abstractmethod
-    def get_detector_integration(self, detector_id: str) -> int:
-        """Get frame integration count."""
+    def get_detector_integration(self, detector_id: str) -> Optional[int]:
+        """Get frame integration count. Returns None if unknown."""
         pass
 
     @abstractmethod
     def get_detector_inserted(self, detector_id: str) -> bool:
-        """Return True if detector is mechanically inserted."""
+        """Return True if detector is mechanically inserted. (Strict Primitive)"""
         pass
 
     @abstractmethod
     def get_detector_frame_rate(self, detector_id: str) -> Optional[Quantity]:
+        """Get estimated frame rate. Returns None if unknown."""
         pass
 
     # ---Atomic Setters ---
@@ -859,11 +970,14 @@ class TemMicroscope(ABC):
         if not request.validate():
             raise ValueError(f"Invalid DetectorControlRequest: {request}")
 
+        logger.info(f"[DET] Executing Control: {request.action or 'Configure'} on {request.detector_id}")
+
         sys = self.system_settings.detector_system
         if sys and request.target:
             # Check if capabilities support the request
             check = sys.is_supported(request.target)
             if not check:
+                logger.error(f"[DET] Unsupported settings: {check.reasons}")
                 raise RuntimeError(f"Detector settings not supported: {check.reasons}")
 
         if request.action == "INSERT":
@@ -881,7 +995,7 @@ class TemMicroscope(ABC):
     # --- Atomic Methods ---
     @abstractmethod
     def get_valve_state(self, valve_name: str) -> str:
-        """Get Valve State ('OPEN', 'CLOSED'). Name examples: 'column', 'gun'."""
+        """Get Valve State ('OPEN', 'CLOSED' or 'UNKNOWN'). (Strict Primitive)"""
         pass
 
     @abstractmethod
@@ -890,8 +1004,8 @@ class TemMicroscope(ABC):
         pass
 
     @abstractmethod
-    def get_pressure(self, gauge_name: str) -> Quantity:
-        """Get Pressure. Units: Pressure (Pa/Torr). Name: 'column', 'gun', etc."""
+    def get_pressure(self, gauge_name: str) -> Optional[Quantity]:
+        """Get Pressure. Units: Pressure (Pa/Torr). Name: 'column', 'gun'. Returns None if unknown."""
         pass
 
     # --- Logic Layer ---
@@ -921,6 +1035,7 @@ class TemMicroscope(ABC):
         if not request.validate():
             raise ValueError(f"Invalid VacuumControlRequest: {request}")
 
+        logger.info("[VAC] Executing Control Request")
         if request.target:
             self.apply_vacuum_settings(request.target)
 
@@ -935,8 +1050,8 @@ class TemMicroscope(ABC):
         pass
 
     @abstractmethod
-    def get_aperture(self, aperture_id: str) -> Aperture:
-        """Get state (inserted, size, position) of an aperture."""
+    def get_aperture(self, aperture_id: str) -> Optional[Aperture]:
+        """Get state (inserted, size, position) of an aperture. Returns None if unknown."""
         pass
 
     @abstractmethod
@@ -948,7 +1063,7 @@ class TemMicroscope(ABC):
 
     def get_all_apertures(self) -> Dict[str, Aperture]:
         """Aggregator: returns state of all apertures."""
-        return {a_id: self.get_aperture(a_id) for a_id in self.list_apertures()}
+        return {a_id: self.get_aperture(a_id) for a_id in self.list_apertures() if self.get_aperture(a_id) is not None}
 
     def execute_aperture_control(self, request: ApertureControlRequest) -> None:
         """
@@ -959,11 +1074,17 @@ class TemMicroscope(ABC):
         if not request.validate():
             raise ValueError(f"Invalid ApertureControlRequest: {request}")
 
+        logger.info(f"[APT] Executing Control on '{request.aperture_id}'")
+
         final_target = request.target
 
         # Handle Relative Movement logic
         if request.relative and request.target.position:
             current = self.get_aperture(request.aperture_id)
+            if current is None:
+                raise RuntimeError(
+                    f"Cannot execute relative move: Failed to read current state of '{request.aperture_id}'")
+
             if current.position:
                 new_pos = replace(request.target.position)
                 # Apply delta to current position (manual vector addition)
@@ -1001,6 +1122,10 @@ class TemMicroscope(ABC):
             return
 
         current = self.get_stage_position()
+
+        if current is None:
+            raise RuntimeError("Safe Move Failed: Cannot read current stage position to calculate steps.")
+
         max_step_nm = sys.max_step_distance.to(Units.NM).magnitude
 
         # Calculate max delta across active axes

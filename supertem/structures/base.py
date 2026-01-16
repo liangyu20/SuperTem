@@ -1641,6 +1641,7 @@ class StageSystemSettings:
         # 3. Value Checks
         v.check_gt_zero(self.max_step_distance, "max_step_distance", unit_aware=True, reset_to=Q_(50000.0, Units.NM))
         v.check_ge_zero(self.settle_time, "settle_time", unit_aware=True, reset_to=Q_(0.2, Units.SEC))
+        v.check_ge_zero(self.timeout, "timeout", unit_aware=True, reset_to=Q_(10.0, Units.SEC))
 
         # 4. Eucentric Check
         if self.eucentric_z is not None and self.z_limits:
@@ -1652,7 +1653,7 @@ class StageSystemSettings:
         return v.valid
 
     def is_safe_move(self, target: StagePosition, current: Optional[StagePosition] = None,
-                     relative: bool = False) -> SafetyCheck:
+                     relative: bool = False, ignore_step_limit: bool = False) -> SafetyCheck:
         """
         RUNTIME CHECK: External Safety.
         Returns a SafetyCheck object (True/False + reasons) without modifying self.extra.
@@ -1661,6 +1662,12 @@ class StageSystemSettings:
         1. Is the axis enabled? (can_x, can_tilt_x, etc.)
         2. Is the destination within absolute limits? (x_limits, etc.)
         3. Is the step size within dynamic limits? (max_step_distance, etc.)
+
+        Args:
+            target: The destination or delta.
+            current: The starting position (required for relative moves or step checks).
+            relative: Whether target is a delta.
+            ignore_step_limit: If True, skips max_step_distance checks (used when interpolator is active).
         """
         reasons = []
 
@@ -1714,7 +1721,7 @@ class StageSystemSettings:
         check_bound(abs_target.tilt_y, self.tilt_y_limits, "tilt_y")
 
         # --- 4. Check Dynamic Limits (Step Size) ---
-        if step_vector is not None:
+        if not ignore_step_limit and step_vector is not None:
             # XY Euclidian Distance
             if step_vector.x is not None or step_vector.y is not None:
                 dx = step_vector.x if step_vector.x is not None else Q_(0, Units.NM)

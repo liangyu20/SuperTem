@@ -335,7 +335,41 @@ command to change the microscope's state.
       Requests are transient. They are created, validated, executed by the
       Manager/Driver, and then discarded. They are rarely stored long-term.
 
-3. How to Write a New Request
+3. Command, Patch, and Hybrid Requests
+-------------------------------------------------------------------------------
+This module defines three high-level request shapes based on how "Intent" is
+structured and validated:
+
+1) Command Requests (Action-Driven)
+   - Examples: StageControlRequest
+   - Intent is carried solely by an explicit `action` enum (e.g. STOP, HOME).
+   - Validation MUST require `action` to be present. The `target` payload is
+     usually not required (or logically ignored) for these operations.
+
+2) Patch Requests (Diff-Driven)
+   - Examples: BeamControlRequest, ProjectionControlRequest, VacuumControlRequest,
+               ApertureControlRequest, StageMoveRequest
+   - Intent is carried by providing at least one non-None field in the `target`
+     payload (a "patch").
+   - The "empty patch" guard ensures that vendor extras in the payload count
+     as valid intent (avoids rejecting vendor-specific updates as empty).
+
+3) Hybrid Requests (Context-Dependent)
+   - Examples: DetectorControlRequest, ScanControlRequest
+   - The validation logic shifts based on the specific operation mode:
+     A. Action-Only (Command-like):
+        Example: Detector "INSERT", Scan "STOP".
+        Intent is carried by the `action`; `target` settings are optional/ignored.
+     B. Payload-Only (Patch-like):
+        Example: Detector "Set Exposure" (action=None, target=Settings(...)).
+        Intent is carried by the `target` payload settings.
+     C. Composite (Action + Payload):
+        Example: Scan "START".
+        Requires both an `action` (to trigger the engine) AND a `target` (to
+        define parameters like dwell time). Validation enforces the presence
+        of the payload when the specific action demands it.
+
+4. How to Write a New Request
 -------------------------------------------------------------------------------
    1. Define the class with `_mode: ParseMode = ParseMode.STRICT`.
    2. Include the ID field (e.g. `beam_id`) and validate its presence.
@@ -449,10 +483,7 @@ import tifffile as tff
 # Versioning & Imports
 # =============================================================================
 
-try:
-    from supertem.config import METADATA_VERSION  # type: ignore
-except Exception:
-    METADATA_VERSION = "1"
+SCHEMA_VERSION = "1.0.0"
 
 from importlib.metadata import version, PackageNotFoundError
 
@@ -613,6 +644,32 @@ class Extras:
                     except:
                         ex.raw[f"{owner}.extra.{k}"] = repr(v)
         return ex
+
+def _has_actionable_extras(extra: "Extras") -> bool:
+    """Return True if `extra` carries explicit user intent.
+
+    Notes:
+        - In control-plane requests, vendor-specific settings may be carried only
+          in `extra.vendor[...]`. Such requests should not be treated as "empty".
+        - We intentionally ignore `raw` and `notes` here to avoid counting parse/
+          validation diagnostics as user intent.
+    """
+    if extra is None:
+        return False
+
+    def _has_non_none(v):
+        if v is None:
+            return False
+        if isinstance(v, dict):
+            return any(_has_non_none(x) for x in v.values())
+        if isinstance(v, (list, tuple, set)):
+            return any(_has_non_none(x) for x in v)
+        if isinstance(v, str):
+            return len(v.strip()) > 0
+        return True  # numbers / bools / objects
+
+    return _has_non_none(getattr(extra, 'vendor', None)) or _has_non_none(getattr(extra, 'unknown', None))
+
 
 @dataclass
 class SafetyCheck:
@@ -1160,6 +1217,33 @@ class Validator:
             heal=lambda: setattr(self.obj, name.split('.')[-1], reset_to)
         )
 
+    def check_has_intent(self, obj: Any, key_suffix: str, error_msg: str,
+                         ignore: Iterable[str] = ()) -> bool:
+        """
+        Validates that 'obj' has at least one non-None field (excluding internal/ignored fields)
+        OR has actionable extras.
+        """
+        if obj is None:
+            return self.check(False, key_suffix, error_msg)
+
+        has_intent = False
+
+        # 1. Check Standard Fields
+        # Always ignore internal framework fields
+        ignore_set = set(ignore) | {"extra", "_mode"}
+
+        if dataclasses.is_dataclass(obj):
+            for f in dataclasses.fields(obj):
+                if f.name not in ignore_set and getattr(obj, f.name) is not None:
+                    has_intent = True
+                    break
+
+        # 2. Check Extras (Vendor Extensions)
+        if not has_intent:
+            has_intent = _has_actionable_extras(getattr(obj, "extra", None))
+
+        return self.check(has_intent, key_suffix, error_msg)
+
 def _auto_to_dict(obj: Any, unit_map: Dict[str, str] = None, key_map: Dict[str, str] = None) -> Dict[str, Any]:
     """
     Automatically converts a dataclass to a dict using introspection and mapping rules.
@@ -1311,15 +1395,15 @@ class Point:
 
     Role:     Structure
     Context:  Both (Data-plane / Control-plane)
-    Category: A (Config)
+    Category: C / D (Measured State / Intent)
 
     Attributes:
         x (Optional[float]): X coordinate.
-            None Behavior: Defaulted to 0.0.
+            None Behavior: Preserved as None (Intent/Unknown).
         y (Optional[float]): Y coordinate.
-            None Behavior: Defaulted to 0.0.
+            None Behavior: Preserved as None (Intent/Unknown).
         z (Optional[float]): Z coordinate.
-            None Behavior: Defaulted to 0.0.
+            None Behavior: Preserved as None (Intent/Unknown).
         name (Optional[str]): Label for this point.
             None Behavior: Preserved as None.
     """
@@ -1332,16 +1416,22 @@ class Point:
 
     def __post_init__(self):
         p = FieldParser(self, self._mode, "Point")
-        # Category A: Apply Defaults (0.0) safely
-        self.x = p.float(self.x, "x", default=0.0)
-        self.y = p.float(self.y, "y", default=0.0)
-        self.z = p.float(self.z, "z", default=0.0)
+        # Category C/D: Preserve None (Intent/State pattern)
+        # We REMOVED default=0.0 to prevent accidental zeroing of axes
+        self.x = p.float(self.x, "x", default=None)
+        self.y = p.float(self.y, "y", default=None)
+        self.z = p.float(self.z, "z", default=None)
         self.name = p.str(self.name, "name")
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
-        for axis in ["x", "y", "z"]:
-            v.check_finite(getattr(self, axis), f"coordinates.{axis}", reset_to=0.0)
+        # Only validate finite-ness if a value is actually present
+        if self.x is not None:
+            v.check_finite(self.x, "coordinates.x", reset_to=0.0)
+        if self.y is not None:
+            v.check_finite(self.y, "coordinates.y", reset_to=0.0)
+        if self.z is not None:
+            v.check_finite(self.z, "coordinates.z", reset_to=0.0)
         return v.valid
 
     def to_dict(self) -> dict:
@@ -1350,7 +1440,13 @@ class Point:
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "Point":
         if isinstance(d, (list, tuple)) and len(d) in (2, 3):
-            return Point(x=d[0], y=d[1], z=d[2] if len(d) == 3 else 0.0, _mode=as_parse_mode(mode))
+            # Map list input to x, y, (z)
+            return Point(
+                x=d[0],
+                y=d[1],
+                z=d[2] if len(d) == 3 else None,
+                _mode=as_parse_mode(mode)
+            )
         return _auto_from_dict(Point, d, mode)
 
 @dataclass
@@ -3059,7 +3155,7 @@ class MicroscopeImageMetadata:
 
     def __post_init__(self):
         p = FieldParser(self, self._mode, "MicroscopeImageMetadata")
-        self.version = p.str(self.version, "version", default=str(METADATA_VERSION))
+        self.version = p.str(self.version, "version", default=SCHEMA_VERSION)
         self.created_at = p.str(self.created_at, "created_at",
                                 default=datetime.datetime.now(datetime.timezone.utc).isoformat())
         self.magnification = p.float(self.magnification, "magnification")
@@ -3153,6 +3249,7 @@ class MicroscopeImage:
             clipped = np.clip(mean_val, 0.0, 255.0).astype(np.uint8)
             return np.full_like(a, clipped, dtype=np.uint8)
         scaled = (af - lo) * (255.0 / rng)
+        scaled = np.nan_to_num(scaled, nan=0.0, posinf=255.0, neginf=0.0)
         return np.clip(scaled, 0.0, 255.0).astype(np.uint8)
 
     @classmethod
@@ -3478,7 +3575,10 @@ class StageMoveRequest:
 
         # Check emptiness of target
         axes = [self.target.x, self.target.y, self.target.z, self.target.r, self.target.tilt_x, self.target.tilt_y]
-        v.check(any(a is not None for a in axes), "empty", "StageMoveRequest has no target coordinates")
+        has_intent = any(a is not None for a in axes)
+        has_intent = has_intent or _has_actionable_extras(getattr(self.target, 'extra', None))
+        has_intent = has_intent or _has_actionable_extras(getattr(self, 'extra', None))
+        v.check(has_intent, "empty", "StageMoveRequest has no target coordinates")
 
         if self.drive_type == StageDriveType.PIEZO.value and self.relative:
             # Heuristic: Warn if requesting massive moves (> 5um) on Piezo
@@ -3592,20 +3692,10 @@ class DetectorControlRequest:
         v.check(bool(self.detector_id), "detector_id", "detector_id is required")
         v.check_nested(self.target)
 
-        # Logic Check: Ensure we are doing *something*
-        # 1. Check if settings has any non-None fields (Intent)
-        has_settings_intent = False
-        for f in dataclasses.fields(self.target):
-            # Ignore internal fields and the ID itself (which is just identity, not a change)
-            if f.name not in ["extra", "_mode", "detector_id"] and getattr(self.target, f.name) is not None:
-                has_settings_intent = True
-                break
-
-        # 2. Check if action is present
-        has_action = self.action is not None
-
-        v.check(has_settings_intent or has_action, "empty_intent",
-                "Request must have either settings to apply or an action to execute")
+        if not self.action:
+            v.check_has_intent(self.target, "empty_intent",
+                               "Request must have either settings to apply or an action to execute",
+                               ignore=["detector_id"])
 
         if self.action:
             valid_actions = {"INSERT", "RETRACT", "COOLDOWN", "WARMUP", "RESET"}
@@ -3645,15 +3735,7 @@ class BeamControlRequest:
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
         v.check_nested(self.target)
-
-        # Check for empty intent
-        has_intent = False
-        for f in dataclasses.fields(self.target):
-            if f.name not in ["extra", "_mode"] and getattr(self.target, f.name) is not None:
-                has_intent = True
-                break
-
-        v.check(has_intent, "empty_target", "Beam request has no parameters set")
+        v.check_has_intent(self.target, "empty_target", "Beam request has no parameters set")
         return v.valid
 
     def to_dict(self) -> dict:
@@ -3687,15 +3769,7 @@ class ProjectionControlRequest:
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
         v.check_nested(self.target)
-
-        # Check for empty intent
-        has_intent = False
-        for f in dataclasses.fields(self.target):
-            if f.name not in ["extra", "_mode"] and getattr(self.target, f.name) is not None:
-                has_intent = True
-                break
-
-        v.check(has_intent, "empty_target", "Projection request has no parameters set")
+        v.check_has_intent(self.target, "empty_target", "Projection request has no parameters set")
 
         # Specific Logic: If switching to DIFFRACTION, you must provide a camera length
         if self.target.optical_mode == "DIFFRACTION":
@@ -3746,6 +3820,8 @@ class ScanControlRequest:
         # 2. Settings required if Starting
         if self.action in {"START", "SINGLE_FRAME"}:
             v.check_nested(self.target)
+            v.check_has_intent(self.target, "target.empty",
+                               "Scan START requires explicit settings.")
 
         return v.valid
 
@@ -3785,12 +3861,8 @@ class VacuumControlRequest:
         v = Validator(self, mode)
         v.check_nested(self.target)
 
-        # Ensure at least one valve/pump state is being requested
-        has_intent = (self.target.column_valve_state is not None or
-                      self.target.gun_valve_state is not None or
-                      self.target.turbo_pump_state is not None)
-
-        v.check(has_intent, "empty_target", "Request must specify at least one state change")
+        v.check_has_intent(self.target, "empty_target",
+                           "Request must specify at least one state change")
         return v.valid
 
     def to_dict(self) -> dict:
@@ -3851,6 +3923,9 @@ class ApertureControlRequest:
         # No-Op Check
         has_intent = (
                 self.target.inserted is not None or self.target.size_index is not None or self.target.position is not None)
+        # Vendor-only intents may live exclusively in Extras.vendor / Extras.unknown
+        has_intent = has_intent or _has_actionable_extras(getattr(self.target, 'extra', None))
+        has_intent = has_intent or _has_actionable_extras(getattr(self, 'extra', None))
         v.check(has_intent, "empty_payload", "Request contains no changes")
 
         return v.valid
@@ -3909,6 +3984,10 @@ class AcquisitionRequest:
             v.check(False, "id_mismatch",
                     f"Ambiguous IDs: outer={self.detector_id}, inner={self.detector.detector_id}",
                     heal=lambda: setattr(self.detector, 'detector_id', self.detector_id))
+
+        v.check_has_intent(self.detector, "detector.empty",
+                           "Acquisition requires explicit detector settings.",
+                           ignore=["detector_id"])
         return v.valid
 
     def to_dict(self) -> dict:

@@ -153,7 +153,7 @@ from supertem.structures.base import (
     Quantity,
     Extras,
     Point,
-    ROI
+    ROI, DetectorCapabilities
 )
 
 # Import Vendor Adapters
@@ -161,10 +161,6 @@ from supertem.vendor.JEOL import jeol_adapter
 from supertem.vendor.JEOL.jeol_eos_tables import EOS_MODE_TABLES, get_list
 
 logger = logging.getLogger(__name__)
-
-# Global placeholders for Lazy Loading
-TEM3 = None
-detector = None
 
 
 class JeolMicroscope(TemMicroscope):
@@ -195,38 +191,17 @@ class JeolMicroscope(TemMicroscope):
     def __init__(self, config: MicroscopeSettings):
         """
         Initialize the driver.
-
-        Note:
-            We use 'Lazy Loading' for PyJEM. The library is imported here (inside __init__)
-            rather than at the module level. This ensures that importing this file in a
-            simulation or test environment (where PyJEM is missing) does not crash the process.
+        PyJEM modules are loaded into instance variables (self.tem3_mod, self.det_mod)
+        to allow independent instantiation and better testing support.
         """
         super().__init__(config)
 
-        # --- Lazy Loading Implementation ---
-        global TEM3, detector
-        if TEM3 is None:
-            try:
-                from PyJEM import TEM3 as _T3
-                TEM3 = _T3
-            except ImportError:
-                try:
-                    from PyJEM.offline import TEM3 as _T3
-                    TEM3 = _T3
-                except ImportError:
-                    TEM3 = None
-                    logger.warning("[INIT] PyJEM not found. JeolMicroscope will be non-functional.")
+        # Instance variables for PyJEM modules
+        self.tem3_mod = None
+        self.det_mod = None
 
-        if detector is None:
-            try:
-                from PyJEM import detector as _d
-                detector = _d
-            except ImportError:
-                try:
-                    from PyJEM.offline import detector as _d
-                    detector = _d
-                except ImportError:
-                    detector = None
+        # Load modules immediately
+        self._load_pyjem_modules()
 
         # Hardware Interface Placeholders
         self.stage = None
@@ -257,6 +232,64 @@ class JeolMicroscope(TemMicroscope):
         val = getattr(config, 'defocus_scale', cfg.get('defocus_scale', 1.0))
         self.defocus_scale: float = float(val)
 
+    def _load_pyjem_modules(self):
+        """Internal helper to import PyJEM modules into instance variables."""
+        model_name = (self.system_settings.info.model or "").upper()
+        force_offline = "OFFLINE" in model_name
+
+        # ---------------------------------------------------------
+        # A. Load TEM3 Interface
+        # ---------------------------------------------------------
+        if self.tem3_mod is None:
+            if force_offline:
+                logger.info("[INIT] Offline mode requested. Forcing PyJEM.offline.TEM3...")
+                try:
+                    from PyJEM.offline import TEM3 as _T3
+                    self.tem3_mod = _T3
+                except ImportError as e:
+                    logger.error(f"[INIT] Failed to import PyJEM.offline.TEM3: {e}")
+                    raise RuntimeError("Offline mode requested but PyJEM.offline is missing.") from e
+            else:
+                try:
+                    from PyJEM import TEM3 as _T3
+                    self.tem3_mod = _T3
+                    logger.info("[INIT] PyJEM.TEM3 imported (Online Mode).")
+                except ImportError:
+                    logger.warning("[INIT] PyJEM.TEM3 missing. Falling back to PyJEM.offline...")
+                    try:
+                        from PyJEM.offline import TEM3 as _T3
+                        self.tem3_mod = _T3
+                        logger.info("[INIT] PyJEM.offline.TEM3 imported (Fallback).")
+                    except ImportError:
+                        self.tem3_mod = None
+                        logger.warning("[INIT] PyJEM.TEM3 module absent.")
+
+        # ---------------------------------------------------------
+        # B. Load Detector Interface
+        # ---------------------------------------------------------
+        if self.det_mod is None:
+            if force_offline:
+                logger.info("[INIT] Offline mode requested. Forcing PyJEM.offline.detector...")
+                try:
+                    from PyJEM.offline import detector as _d
+                    self.det_mod = _d
+                except ImportError as e:
+                    logger.error(f"[INIT] Failed to import PyJEM.offline.detector: {e}")
+            else:
+                try:
+                    from PyJEM import detector as _d
+                    self.det_mod = _d
+                    logger.info("[INIT] PyJEM.detector imported (Online Mode).")
+                except ImportError:
+                    logger.warning("[INIT] PyJEM.detector missing. Falling back to PyJEM.offline...")
+                    try:
+                        from PyJEM.offline import detector as _d
+                        self.det_mod = _d
+                        logger.info("[INIT] PyJEM.offline.detector imported (Fallback).")
+                    except ImportError:
+                        self.det_mod = None
+                        logger.warning("[INIT] PyJEM.detector module absent.")
+
     # =========================================================================
     # 1. Connection & Lifecycle
     # =========================================================================
@@ -264,30 +297,27 @@ class JeolMicroscope(TemMicroscope):
     def connect(self, host: str, port: Optional[int] = None, **kwargs) -> None:
         """
         Connect to the JEOL TEM3 interface and initialize sub-modules.
-
-        Args:
-            host: The IP address of the TEM server (unused by standard PyJEM, but required by signature).
         """
-        if not TEM3:
+        if not self.tem3_mod:
             logger.error("[CONN] Cannot connect: PyJEM library not found.")
             raise RuntimeError("PyJEM library not found.")
 
         try:
             logger.info(f"[CONN] Connecting to TEM3 interface (Host: {host})...")
-            TEM3.connect()
+            self.tem3_mod.connect()
 
             # Initialize individual hardware controllers
-            self.stage = TEM3.Stage3()
-            self.eos = TEM3.EOS3()
-            self.ht = TEM3.HT3()
-            self.lens = TEM3.Lens3()
-            self.def_ = TEM3.Def3()
-            self.apt = TEM3.Apt3()
-            self.scan = TEM3.Scan3()
-            self.vac = TEM3.VACUUM3()
-            self.feg = TEM3.FEG3()
-            self.gun = TEM3.GUN3()
-            self.det3 = TEM3.Detector3()
+            self.stage = self.tem3_mod.Stage3()
+            self.eos = self.tem3_mod.EOS3()
+            self.ht = self.tem3_mod.HT3()
+            self.lens = self.tem3_mod.Lens3()
+            self.def_ = self.tem3_mod.Def3()
+            self.apt = self.tem3_mod.Apt3()
+            self.scan = self.tem3_mod.Scan3()
+            self.vac = self.tem3_mod.VACUUM3()
+            self.feg = self.tem3_mod.FEG3()
+            self.gun = self.tem3_mod.GUN3()
+            self.det3 = self.tem3_mod.Detector3()
 
             self._connected = True
             self._refresh_detectors()
@@ -326,35 +356,31 @@ class JeolMicroscope(TemMicroscope):
         Retrieve the PyJEM detector function module.
         Newer PyJEM versions nest functions under `detector.function`.
         """
-        if detector is None:
+        if self.det_mod is None:
             return None
-        fn_mod = getattr(detector, "function", None)
-        return fn_mod if fn_mod is not None else detector
+        fn_mod = getattr(self.det_mod, "function", None)
+        return fn_mod if fn_mod is not None else self.det_mod
 
     def _refresh_detectors(self) -> None:
         """
-        Scan for attached detectors and cache their instances.
-
-        This prevents creating new PyJEM objects (and opening new sockets)
-        for every single image acquisition.
+        Scan for attached detectors, cache their instances, and update
+        SystemSettings.detector_system with their hardware capabilities.
         """
+        # 1. Reset Internal State
         self._active_detectors = {}
         self._primary_detector_id = None
-        # Default scan configuration
         self._scan_cfg = {
-            'pixel_dwell_us': 10.0,
-            'flyback_us': 0.0,
-            'width_px': 512,
-            'height_px': 512,
+            'pixel_dwell_us': 10.0, 'flyback_us': 0.0,
+            'width_px': 512, 'height_px': 512,
         }
 
-        if detector is None:
+        if self.det_mod is None:
             return
 
-        # Handle PyJEM version differences in module structure
-        fn_mod = getattr(detector, "function", None)
+        # 2. PyJEM Discovery Logic
+        fn_mod = getattr(self.det_mod, "function", None)
         if fn_mod is None:
-            fn_mod = detector
+            fn_mod = self.det_mod
 
         getter = getattr(fn_mod, "get_attached_detector", None)
         if not callable(getter):
@@ -362,28 +388,67 @@ class JeolMicroscope(TemMicroscope):
 
         try:
             ids = list(getter())
-            logger.debug(f"[DET] Discovered detectors: {ids}")
-        except Exception as e:
-            logger.debug(f"[DET] Failed to list attached detectors: {e}")
+            logger.info(f"[DET] Discovered detectors: {ids}")
+        except Exception:
             return
+
+        # 3. Load Capabilities
+        caps_map: Dict[str, DetectorCapabilities] = {}
 
         for det_id in ids:
             try:
-                self._active_detectors[det_id] = detector.Detector(det_id)
+                # Create and Cache
+                d_obj = self.det_mod.Detector(det_id)
+                self._active_detectors[det_id] = d_obj
+
+                # Extract Capabilities (Min/Max settings)
+                try:
+                    raw = d_obj.get_detectorsetting()
+                    _, caps = jeol_adapter.from_jeol_detector_response(raw, det_id)
+                    if caps:
+                        caps_map[det_id] = caps
+                except Exception:
+                    pass
             except Exception:
                 continue
 
         if ids:
             self._primary_detector_id = ids[0]
 
+        # 4. Update System Configuration (CORRECTED)
+        # We must write to: self.system_settings.detector_system.capabilities_by_id
+
+        sys_config = self.system_settings
+
+        # Ensure we have a valid place to write
+        if sys_config is not None:
+            if sys_config.detector_system is None:
+                # If missing, create a default container so we don't crash
+                # (Assuming DetectorSystemSettings is imported from base)
+                from supertem.structures.base import DetectorSystemSettings
+                sys_config.detector_system = DetectorSystemSettings()
+
+            det_sys = sys_config.detector_system
+
+            # Update Available IDs
+            det_sys.available_detector_ids = ids
+
+            # Update Capabilities
+            if det_sys.capabilities_by_id is None:
+                det_sys.capabilities_by_id = {}
+
+            det_sys.capabilities_by_id.update(caps_map)
+
+            logger.debug(f"[DET] System capabilities updated for: {list(caps_map.keys())}")
+
     def _get_detector(self, detector_id: str):
         """Retrieve a cached detector instance by ID, creating it if necessary."""
-        if detector is None:
+        if self.det_mod is None:
             raise RuntimeError("PyJEM detector module missing")
 
         d = self._active_detectors.get(detector_id)
         if d is None:
-            d = detector.Detector(detector_id)
+            d = self.det_mod.Detector(detector_id)
             self._active_detectors[detector_id] = d
             # If no primary is set, make this the primary
             if self._primary_detector_id is None:
@@ -673,6 +738,7 @@ class JeolMicroscope(TemMicroscope):
         except Exception as e:
             logger.error(f"[STAGE] SetOrg failed: {e}")
             raise
+
     # =========================================================================
     # 4. Beam Control (Atomic Getters)
     # =========================================================================
@@ -1463,7 +1529,7 @@ class JeolMicroscope(TemMicroscope):
 
     def _get_scan_controller_detector(self):
         """Helper to find the Detector instance that controls scanning (STEM)."""
-        if detector is None:
+        if self.det_mod is None:
             return None
         try:
             det_id = self.get_primary_detector_id()
@@ -1477,7 +1543,7 @@ class JeolMicroscope(TemMicroscope):
             return None
 
     @staticmethod
-    def _first_int(d: dict, keys: tuple[str, ...]) -> Optional[int]:
+    def _first_int(d: dict, keys: Tuple[str, ...]) -> Optional[int]:
         for k in keys:
             if k in d:
                 try:
@@ -1487,7 +1553,7 @@ class JeolMicroscope(TemMicroscope):
         return None
 
     @staticmethod
-    def _first_float(d: dict, keys: tuple[str, ...]) -> Optional[float]:
+    def _first_float(d: dict, keys: Tuple[str, ...]) -> Optional[float]:
         for k in keys:
             if k in d:
                 try:
@@ -1735,7 +1801,7 @@ class JeolMicroscope(TemMicroscope):
 
     def get_detector_exposure(self, detector_id: str) -> Optional[Quantity]:
         """Get detector exposure time."""
-        if detector is None:
+        if self.det_mod is None:
             logger.debug("[DET] GetExposure failed: Hardware not connected.")
             return None
         try:
@@ -1748,7 +1814,7 @@ class JeolMicroscope(TemMicroscope):
 
     def get_detector_binning(self, detector_id: str) -> Optional[int]:
         """Get binning index."""
-        if detector is None:
+        if self.det_mod is None:
             logger.debug("[DET] GetBinning failed: Hardware not connected.")
             return None
         try:
@@ -1761,7 +1827,7 @@ class JeolMicroscope(TemMicroscope):
 
     def get_detector_roi(self, detector_id: str) -> Optional[ROI]:
         """Get Region of Interest."""
-        if detector is None:
+        if self.det_mod is None:
             logger.debug("[DET] GetROI failed: Hardware not connected.")
             return None
         try:
@@ -1774,7 +1840,7 @@ class JeolMicroscope(TemMicroscope):
 
     def get_detector_integration(self, detector_id: str) -> Optional[int]:
         """Get frame integration count."""
-        if detector is None:
+        if self.det_mod is None:
             logger.debug("[DET] GetIntegration failed: Hardware not connected.")
             return None
         try:
@@ -1787,7 +1853,7 @@ class JeolMicroscope(TemMicroscope):
 
     def get_detector_inserted(self, detector_id: str) -> bool:
         """Check if detector is mechanically inserted."""
-        if detector is None:
+        if self.det_mod is None:
             logger.debug("[DET] GetInserted failed: Hardware not connected.")
             return True
         try:
@@ -1810,7 +1876,7 @@ class JeolMicroscope(TemMicroscope):
 
     def set_detector_exposure(self, detector_id: str, exposure: Quantity) -> None:
         """Set detector exposure time."""
-        if detector is None:
+        if self.det_mod is None:
             logger.error("[DET] SetExposure failed: Detector hardware not connected.")
             raise RuntimeError("Detector hardware not connected.")
 
@@ -1829,7 +1895,7 @@ class JeolMicroscope(TemMicroscope):
 
     def set_detector_binning(self, detector_id: str, index: int) -> None:
         """Set detector binning."""
-        if detector is None:
+        if self.det_mod is None:
             logger.error("[DET] SetBinning failed: Detector hardware not connected.")
             raise RuntimeError("Detector hardware not connected.")
 
@@ -1844,7 +1910,7 @@ class JeolMicroscope(TemMicroscope):
 
     def set_detector_roi(self, detector_id: str, roi: Optional[ROI]) -> None:
         """Set detector ROI."""
-        if detector is None:
+        if self.det_mod is None:
             logger.error("[DET] SetROI failed: Detector hardware not connected.")
             raise RuntimeError("Detector hardware not connected.")
 
@@ -1860,7 +1926,7 @@ class JeolMicroscope(TemMicroscope):
 
     def set_detector_integration(self, detector_id: str, count: int) -> None:
         """Set frame integration count."""
-        if detector is None:
+        if self.det_mod is None:
             logger.error("[DET] SetIntegration failed: Detector hardware not connected.")
             raise RuntimeError("Detector hardware not connected.")
 
@@ -1875,7 +1941,7 @@ class JeolMicroscope(TemMicroscope):
 
     def set_detector_insertion(self, detector_id: str, inserted: bool) -> None:
         """Insert or retract detector."""
-        if detector is None:
+        if self.det_mod is None:
             logger.error("[DET] SetInsertion failed: Detector hardware not connected.")
             raise RuntimeError("Detector hardware not connected.")
 
@@ -1890,81 +1956,152 @@ class JeolMicroscope(TemMicroscope):
             logger.error(f"[DET] SetInsertion failed: {e}")
             raise
 
+    # =========================================================================
+    # 7b. Detector Control (Overrides)
+    # =========================================================================
+
+    def get_detector_settings(self, detector_id: str) -> DetectorSettings:
+        """
+        Override: Get full detector state including vendor extras (Gain, Offset, etc).
+        Fetches the complete settings payload from hardware via `get_detectorsetting`
+        and uses the adapter to populate standard fields and extras.
+        """
+        if self.det_mod is None:
+            logger.debug("[DET] GetSettings failed: Hardware not connected.")
+            return DetectorSettings(detector_id=detector_id)
+
+        try:
+            d = self._get_detector(detector_id)
+            # Fetch raw dict from PyJEM (contains GainIndex, ScanMode, etc.)
+            raw = d.get_detectorsetting()
+
+            # Use adapter to parse standard fields AND pack unknown keys into extra.vendor['JEOL']
+            # Note: Expects adapter to return (DetectorSettings, DetectorCapabilities)
+            settings, _ = jeol_adapter.from_jeol_detector_response(raw, detector_id)
+            return settings
+        except Exception as e:
+            logger.debug(f"[DET] GetSettings({detector_id}) failed: {e}")
+            return DetectorSettings(detector_id=detector_id)
+
+    def apply_detector_settings(self, detector_id: str, settings: DetectorSettings) -> None:
+        """
+        Override: Apply settings using bulk setter to handle extras (Gain, Offset).
+        Standard atomic setters (e.g. set_detector_exposure) do not cover all vendor
+        capabilities. This method constructs a full configuration dictionary
+        (merging standard fields + extra.vendor['JEOL']) and sends it via `set_detectorsetting`.
+        """
+        if self.det_mod is None:
+            logger.error("[DET] ApplySettings failed: Hardware not connected.")
+            raise RuntimeError("Detector hardware not connected.")
+
+        try:
+            d = self._get_detector(detector_id)
+
+            # Use adapter to convert standard fields + vendor extras back into a single JEOL dict
+            payload = jeol_adapter.to_jeol_detector_config(settings)
+
+            if not payload:
+                logger.debug(f"[DET] ApplySettings({detector_id}): No changes in payload.")
+                return
+
+            logger.debug(f"[DET] set_detectorsetting({list(payload.keys())})")
+            d.set_detectorsetting(payload)
+
+        except Exception as e:
+            logger.error(f"[DET] ApplySettings({detector_id}) failed: {e}")
+            raise
+
     def acquire_image(self, request: AcquisitionRequest) -> MicroscopeImage:
         """
         Execute an image acquisition.
 
-        Steps:
-        1. Resolve the detector ID.
-        2. Apply requested settings (Exposure, Binning, etc.).
-        3. Trigger acquisition (Snapshot).
-        4. Capture full microscope metadata (Stage, Beam, etc.).
-        5. Return structured MicroscopeImage.
+        This implementation uses the overridden `apply_detector_settings` to ensure
+        all vendor-specific properties (Gain, Offset, etc.) are applied to the hardware
+        before the snapshot is taken.
         """
-        if detector is None:
-            raise RuntimeError("Detector module missing")
+        # 1. Hardware Availability Check
+        if self.det_mod is None:
+            logger.error("[DET] Acquisition failed: PyJEM Detector module missing.")
+            raise RuntimeError("Detector module missing.")
 
+        # 2. Resolve Detector ID
+        # Priority: Request ID -> Request Object ID -> Primary Hardware ID -> First Available
         det_id = (request.detector_id
                   or getattr(request.detector, "detector_id", None)
                   or (self.get_primary_detector_id() or ""))
 
         if not det_id:
-            raise RuntimeError("No detector_id provided and no primary detector available")
+            logger.error("[DET] Acquisition failed: No detector selected or available.")
+            raise RuntimeError("No detector_id provided and no primary detector available.")
 
         logger.debug(f"[DET] Acquiring Image on {det_id}")
         d = self._get_detector(det_id)
 
-        # Apply temporary settings
+        # 3. Apply Settings (Bulk Configuration)
+        # We use apply_detector_settings instead of atomic setters.
+        # This allows Gain, Offset, and standard physics (Exposure) to be sent in one payload.
         det_req = request.detector
         if det_req is not None:
-            if det_req.exposure is not None:
-                self.set_detector_exposure(det_id, det_req.exposure)
-            if det_req.binning_index is not None:
-                self.set_detector_binning(det_id, int(det_req.binning_index))
-            if det_req.frame_integration is not None:
-                self.set_detector_integration(det_id, int(det_req.frame_integration))
-            if det_req.roi is not None:
-                self.set_detector_roi(det_id, det_req.roi)
+            try:
+                self.apply_detector_settings(det_id, det_req)
+            except Exception as e:
+                logger.error(f"[DET] Failed to apply settings before acquisition: {e}")
+                raise
 
-        # Trigger Capture
+        # 4. Trigger Capture (Snapshot)
         raw = None
         try:
+            # PyJEM allows multiple ways to grab data. We try them in order of preference.
             if hasattr(d, "snapshot_rawdata"):
+                # Preferred: Raw data often matches the sensor bit-depth best
                 raw = d.snapshot_rawdata()
             elif hasattr(d, "get_image_cache"):
+                # Fallback: Cached image
                 raw = d.get_image_cache()
             elif hasattr(d, "livesnapshot"):
+                # Fallback: Live view snapshot (often 8-bit, but better than nothing)
                 raw = d.livesnapshot("tif")
+            else:
+                raise RuntimeError(f"Detector {det_id} has no compatible snapshot methods.")
         except Exception as e:
-            logger.error(f"[DET] Acquisition Hardware Failure: {e}")
+            logger.error(f"[DET] Hardware Acquisition Failure: {e}")
             raise
 
-        # Convert to numpy
+        # 5. Process Raw Data -> Numpy Array
+        # PyJEM returns various formats (list of ints, byte strings, dicts).
         arr: np.ndarray
         if raw is None:
             arr = np.zeros((1, 1), dtype=np.uint16)
         elif isinstance(raw, (bytes, bytearray)):
+            # Binary buffer
             try:
                 arr = np.frombuffer(raw, dtype=np.uint16)
             except Exception:
                 arr = np.frombuffer(raw, dtype=np.uint8)
         elif isinstance(raw, list):
+            # List of integers
             arr = np.array(raw)
         elif isinstance(raw, dict) and "data" in raw:
+            # Json wrapper (common in newer PyJEM)
             arr = np.array(raw["data"])
         else:
+            # Fallback
             try:
                 arr = np.array(raw)
             except Exception:
                 arr = np.zeros((1, 1), dtype=np.uint16)
 
-        # Reshape logic for flat arrays (common in PyJEM)
+        # 6. Normalization (Type and Shape)
+        # Ensure uint16 for standard microscopy data
         if arr.dtype not in (np.uint8, np.uint16):
             try:
                 arr = arr.astype(np.uint16, copy=False)
             except Exception:
                 arr = np.array(arr, dtype=np.uint16)
 
+        # Handle 1D Flattened Arrays
+        # PyJEM often returns a flat list. We need to reshape it
+        # based on the requested ROI or the detected scan size.
         roi = None
         if det_req is not None and getattr(det_req, "roi", None) is not None:
             roi = det_req.roi
@@ -1975,53 +2112,62 @@ class JeolMicroscope(TemMicroscope):
                 roi = None
 
         if arr.ndim == 1:
-            cols = int(getattr(roi, "width", 0) or 0) if roi is not None else 0
-            rows = int(getattr(roi, "height", 0) or 0) if roi is not None else 0
+            cols = int(getattr(roi, "width", 0) or 0)
+            rows = int(getattr(roi, "height", 0) or 0)
+
+            # If ROI dimensions are valid and match data size, reshape
             if cols > 0 and rows > 0 and arr.size == cols * rows:
                 arr = arr.reshape((rows, cols))
+            else:
+                # Fallback: Try to guess square, or leave flat if impossible
+                side = int(np.sqrt(arr.size))
+                if side * side == arr.size:
+                    arr = arr.reshape((side, side))
 
+        # Handle 3D Arrays (e.g. RGB or Single Frame Stack)
         if arr.ndim == 3:
             if arr.shape[0] == 1:
                 arr = arr[0]
             elif arr.shape[-1] == 1:
                 arr = arr[..., 0]
+
+        # Ensure at least 2D
         if arr.ndim != 2:
             arr = np.atleast_2d(arr)
 
-        # Collect Metadata
+        # 7. Collect Metadata
         created_at = datetime.now(timezone.utc).isoformat()
-        try:
-            v = self.get_acceleration_voltage()
-            accelerating_voltage_kv = float(v.to(Units.KV).magnitude) if v is not None else None
-        except Exception:
-            accelerating_voltage_kv = None
 
-        try:
-            bc = self.get_beam_current()
-            beam_current_na = float(bc.to(Units.NA).magnitude) if bc is not None else None
-        except Exception:
-            beam_current_na = None
+        # Helper to safely get floats
+        def _safe_get(getter, unit_obj):
+            try:
+                val = getter()
+                return float(val.to(unit_obj).magnitude) if val is not None else None
+            except Exception:
+                return None
 
+        # Capture Microscope State
+        acc_kv = _safe_get(self.get_acceleration_voltage, Units.KV)
+        cur_na = _safe_get(self.get_beam_current, Units.NA)
         try:
+            # Exposure might need specific ID
             exp_q = self.get_detector_exposure(det_id)
-            exposure_ms = float(exp_q.to(Units.MS).magnitude) if exp_q is not None else None
+            exp_ms = float(exp_q.to(Units.MS).magnitude) if exp_q is not None else None
         except Exception:
-            exposure_ms = None
+            exp_ms = None
 
         try:
-            mag = self.get_magnification()
-            magnification = float(mag) if mag is not None else None
+            mag_val = self.get_magnification()
+            mag = float(mag_val) if mag_val is not None else None
         except Exception:
-            magnification = None
+            mag = None
 
-        try:
-            cl = self.get_camera_length()
-            camera_length_mm = float(cl.to(Units.MM).magnitude) if cl is not None else None
-        except Exception:
-            camera_length_mm = None
+        cam_mm = _safe_get(self.get_camera_length, Units.MM)
 
-        w, h = (int(arr.shape[1]), int(arr.shape[0])) if arr.ndim == 2 else (None, None)
+        # Image Dimensions
+        h, w = arr.shape
 
+        # Vendor Specific Metadata (Binning, Integration, ROI)
         jeol_vendor: Dict[str, Any] = {"detector_id": det_id}
         try:
             jeol_vendor["binning_index"] = int(self.get_detector_binning(det_id))
@@ -2031,34 +2177,36 @@ class JeolMicroscope(TemMicroscope):
             jeol_vendor["frame_integration"] = int(self.get_detector_integration(det_id))
         except Exception:
             pass
-        if roi is not None:
+        if roi:
             try:
                 jeol_vendor["roi"] = roi.to_dict() if hasattr(roi, "to_dict") else roi
             except Exception:
                 jeol_vendor["roi"] = None
 
-        state = None
+        # Full State Snapshot (Slow, but useful)
+        state_snapshot = None
         meta_extra = Extras(vendor={"JEOL": jeol_vendor})
         try:
-            state = self.get_full_state()
+            # We attempt to get full state, but don't fail acquisition if it errors
+            state_snapshot = self.get_full_state()
         except Exception as e:
-            try:
-                meta_extra.notes["MicroscopeImageMetadata.state_capture_failed"] = str(e)
-            except Exception:
-                pass
+            if meta_extra.notes is None: meta_extra.notes = {}
+            meta_extra.notes["MicroscopeImageMetadata.state_capture_failed"] = str(e)
 
+        # 8. Construct Result
         metadata = MicroscopeImageMetadata(
             created_at=created_at,
-            magnification=magnification,
-            camera_length_mm=camera_length_mm,
-            image_size_px=(w, h) if (w is not None and h is not None) else None,
-            accelerating_voltage_kv=accelerating_voltage_kv,
-            beam_current_na=beam_current_na,
-            exposure_ms=exposure_ms,
-            microscope_state=state,
+            magnification=mag,
+            camera_length_mm=cam_mm,
+            image_size_px=(w, h),
+            accelerating_voltage_kv=acc_kv,
+            beam_current_na=cur_na,
+            exposure_ms=exp_ms,
+            microscope_state=state_snapshot,
             extra=meta_extra,
             _mode="lenient",
         )
+
         return MicroscopeImage(data=arr, metadata=metadata)
 
     # =========================================================================
@@ -2169,8 +2317,10 @@ class JeolMicroscope(TemMicroscope):
             self.apt.SelectExpKind(kind_idx)
             if target.size_index is not None:
                 self.apt.SetExpSize(kind_idx, int(target.size_index))
+                time.sleep(5)
             if target.position is not None:
                 self.apt.SetPosition(int(target.position.x), int(target.position.y))
+                time.sleep(5)
         except Exception as e:
             logger.error(f"[APT] SetAperture({aperture_id}) failed: {e}")
             raise
@@ -2207,7 +2357,7 @@ class JeolMicroscope(TemMicroscope):
             try:
                 status = self.stage.GetStatus()
                 if isinstance(status, (list, tuple)):
-                    if all(s == 0 for s in status):
+                    if all(s != 1 for s in status):
                         return
             except Exception:
                 pass

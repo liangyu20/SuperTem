@@ -575,18 +575,22 @@ class Extras:
     fit the strict schema ends up here for later inspection instead of causing a crash.
 
     Attributes:
-    vendor: Namespaced storage for vendor-specific extensions.
+    vendor: Namespaced storage for vendor-specific extensions (Identity/State).
+            Example: {"JEOL": {"alpha_selector": 3}}
+    options: Execution modifiers and flags (Behavior/Action).
+             Example: {"tolerance_nm": 5.0, "retries": 3, "timeout": 60}
     unknown: Storage for JSON keys not recognized by the schema.
     raw: Original raw values that failed type coercion/validation.
     notes: Error messages or warnings generated during parsing.
     """
     vendor: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    options: Dict[str, Any] = field(default_factory=dict)
     unknown: Dict[str, Any] = field(default_factory=dict)
     raw: Dict[str, Any] = field(default_factory=dict)
     notes: Dict[str, Any] = field(default_factory=dict)
 
     def is_empty(self) -> bool:
-        return not (self.vendor or self.unknown or self.raw or self.notes)
+        return not (self.vendor or self.options or self.unknown or self.raw or self.notes)
 
     def to_dict(self) -> Dict[str, Any]:
         """Return a JSON-safe payload representation."""
@@ -618,7 +622,7 @@ class Extras:
             return ex
 
         # Smart merge logic
-        known = {"vendor", "unknown", "raw", "notes"}
+        known = {"vendor", "options", "unknown", "raw", "notes"}
         keys = set(value.keys())
 
         if keys and keys.issubset(known):
@@ -626,6 +630,7 @@ class Extras:
             for k in known:
                 if k in value and isinstance(value[k], dict):
                     setattr(ex, k, deepcopy(value[k]))
+
             # Handle vendor special case (vendor keys might not be dicts)
             if "vendor" in value and isinstance(value["vendor"], dict):
                 for vend, payload in value["vendor"].items():
@@ -668,7 +673,10 @@ def _has_actionable_extras(extra: "Extras") -> bool:
             return len(v.strip()) > 0
         return True  # numbers / bools / objects
 
-    return _has_non_none(getattr(extra, 'vendor', None)) or _has_non_none(getattr(extra, 'unknown', None))
+        # Check vendor OR options OR unknown
+    return (_has_non_none(getattr(extra, 'vendor', None)) or
+            _has_non_none(getattr(extra, 'options', None)) or
+            _has_non_none(getattr(extra, 'unknown', None)))
 
 
 @dataclass
@@ -1415,9 +1423,7 @@ class Point:
     _mode: ParseMode = field(default=ParseMode.LENIENT, repr=False)
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "Point")
-        # Category C/D: Preserve None (Intent/State pattern)
-        # We REMOVED default=0.0 to prevent accidental zeroing of axes
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.x = p.float(self.x, "x", default=None)
         self.y = p.float(self.y, "y", default=None)
         self.z = p.float(self.z, "z", default=None)
@@ -1425,7 +1431,6 @@ class Point:
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
-        # Only validate finite-ness if a value is actually present
         if self.x is not None:
             v.check_finite(self.x, "coordinates.x", reset_to=0.0)
         if self.y is not None:
@@ -1440,7 +1445,6 @@ class Point:
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "Point":
         if isinstance(d, (list, tuple)) and len(d) in (2, 3):
-            # Map list input to x, y, (z)
             return Point(
                 x=d[0],
                 y=d[1],
@@ -1472,8 +1476,7 @@ class ROI:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "ROI")
-        # Category A: Apply Defaults
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.x = p.int(self.x, "x", default=0)
         self.y = p.int(self.y, "y", default=0)
         self.width = p.int(self.width, "width", default=512)
@@ -1550,8 +1553,7 @@ class StagePosition:
     }
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "StagePosition")
-        # Category C: Preserve None
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.name = p.str(self.name, "name")
         self.coordinate_system = p.str(self.coordinate_system, "coordinate_system")
         self.x = p.qty(self.x, "x", Units.NM)
@@ -1564,7 +1566,7 @@ class StagePosition:
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
         for axis in ["x", "y", "z", "r", "tilt_x", "tilt_y"]:
-            v.check_finite(getattr(self, axis), axis)  # Default heal is no-op (preserved as None)
+            v.check_finite(getattr(self, axis), axis)
         return v.valid
 
     def __add__(self, other: 'StagePosition') -> 'StagePosition':
@@ -1625,81 +1627,124 @@ class StagePosition:
         })
 
 @dataclass
+class HolderCapabilities:
+    """
+    Defines the mechanical constraints of a specific sample holder.
+    """
+    holder_id: Optional[str] = None
+    model: Optional[str] = None
+
+    # 1. Capabilities (Masks)
+    # If False, these disable the axis even if the system supports it.
+    can_tilt_x: Optional[bool] = None
+    can_tilt_y: Optional[bool] = None
+    can_rotate: Optional[bool] = None
+
+    # 2. Geometric Limits (Overrides)
+    # These override the system limits if stricter.
+    tilt_x_limits: Optional[Tuple["Quantity", "Quantity"]] = None
+    tilt_y_limits: Optional[Tuple["Quantity", "Quantity"]] = None
+    z_limits: Optional[Tuple["Quantity", "Quantity"]] = None
+
+    extra: Extras = field(default_factory=Extras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+
+    _UNITS = {
+        "tilt_x_limits": Units.DEG,
+        "tilt_y_limits": Units.DEG,
+        "z_limits": Units.NM
+    }
+
+    def __post_init__(self):
+        p = FieldParser(self, self._mode, self.__class__.__name__)
+        self.holder_id = p.id(self.holder_id, "holder_id")
+        self.model = p.str(self.model, "model")
+
+        # Default True so we don't accidentally disable things
+        self.can_tilt_x = p.bool(self.can_tilt_x, "can_tilt_x", default=True)
+        self.can_tilt_y = p.bool(self.can_tilt_y, "can_tilt_y", default=True)
+        self.can_rotate = p.bool(self.can_rotate, "can_rotate", default=True)
+
+        self.tilt_x_limits = p.pair_qty(self.tilt_x_limits, "tilt_x_limits", Units.DEG)
+        self.tilt_y_limits = p.pair_qty(self.tilt_y_limits, "tilt_y_limits", Units.DEG)
+        self.z_limits = p.pair_qty(self.z_limits, "z_limits", Units.NM)
+
+    def to_dict(self) -> dict:
+        return _auto_to_dict(self, unit_map=self._UNITS)
+
+    @staticmethod
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "HolderCapabilities":
+        return _auto_from_dict(HolderCapabilities, d, mode, alias_map={
+            "tilt_x_limits": "tilt_x_limits_deg",
+            "tilt_y_limits": "tilt_y_limits_deg",
+            "z_limits": "z_limits_nm"
+        })
+
+
+@dataclass
 class StageSystemSettings:
     """
-    Safety limits and step sizes for physical stage motion.
-
-    Role:     Gatekeeper (System Limits)
-    Context:  Control-plane
-    Category: A (Strict Runtime Config)
-
-    Attributes:
-        enabled (Optional[bool]): Master toggle for stage interaction.
-            None Behavior: Defaulted to True.
-        can_x, can_y, can_z (Optional[bool]): Individual axis toggles.
-            None Behavior: Defaulted to True.
-        can_r, can_tilt_x, can_tilt_y (Optional[bool]): Individual axis toggles.
-            None Behavior: Defaulted to False.
-        x_limits, y_limits, z_limits (Optional[Tuple[Quantity, Quantity]]): Physical travel bounds.
-            None Behavior: Preserved as None (Axis disabled).
-        r_limits, tilt_x_limits, tilt_y_limits (Optional[Tuple[Quantity, Quantity]]): Physical travel bounds.
-            None Behavior: Preserved as None (Axis disabled).
-        max_step_distance (Optional[Quantity]): Safety cap for XY/Z travel per move. Units: nm.
-            None Behavior: Defaulted to 50,000 nm.
-        max_step_deg (Optional[Quantity]): Safety cap for rotation per move. Units: deg.
-            None Behavior: Defaulted to 1.0 deg.
-        eucentric_z (Optional[Quantity]): Calibrated sample height. Units: nm.
-            None Behavior: Preserved as None.
-        settle_time (Optional[Quantity]): Time to wait for vibration damping. Units: s.
-            None Behavior: Defaulted to 0.2 s.
-        timeout (Optional[Quantity]): Max duration for move operations. Units: s.
-            None Behavior: Defaulted to 10.0 s.
+    Configuration for the Stage Subsystem (Goniometer).
     """
     enabled: Optional[bool] = None
+    default_position: Optional[StagePosition] = None
+
+    # --- System Capabilities ---
     can_x: Optional[bool] = None
     can_y: Optional[bool] = None
     can_z: Optional[bool] = None
     can_r: Optional[bool] = None
     can_tilt_x: Optional[bool] = None
     can_tilt_y: Optional[bool] = None
+
+    # --- System Mechanical Limits ---
     x_limits: Optional[Tuple["Quantity", "Quantity"]] = None
     y_limits: Optional[Tuple["Quantity", "Quantity"]] = None
     z_limits: Optional[Tuple["Quantity", "Quantity"]] = None
     r_limits: Optional[Tuple["Quantity", "Quantity"]] = None
     tilt_x_limits: Optional[Tuple["Quantity", "Quantity"]] = None
     tilt_y_limits: Optional[Tuple["Quantity", "Quantity"]] = None
+
+    # --- Tuning ---
     max_step_distance: Optional["Quantity"] = None
     max_step_deg: Optional["Quantity"] = None
     eucentric_z: Optional["Quantity"] = None
     settle_time: Optional["Quantity"] = None
     timeout: Optional["Quantity"] = None
+
+    # --- Holder Registry ---
+    active_holder_id: Optional[str] = None
+    available_holders: Optional[Dict[str, HolderCapabilities]] = None
+
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     _UNITS = {
-        "x_limits": Units.NM, "y_limits": Units.NM, "z_limits": Units.NM,
-        "r_limits": Units.DEG, "tilt_x_limits": Units.DEG, "tilt_y_limits": Units.DEG,
-        "max_step_distance": Units.NM, "max_step_deg": Units.DEG,
-        "eucentric_z": Units.NM, "settle_time": Units.SEC, "timeout": Units.SEC
-    }
-
-    _KEYS = {
-        "max_step_distance": "max_step_nm",
-        "max_step_deg": "max_step_deg"
+        "x_limits": Units.NM,
+        "y_limits": Units.NM,
+        "z_limits": Units.NM,
+        "r_limits": Units.DEG,
+        "tilt_x_limits": Units.DEG,
+        "tilt_y_limits": Units.DEG,
+        "max_step_distance": Units.NM,
+        "max_step_deg": Units.DEG,
+        "eucentric_z": Units.NM,
+        "settle_time": Units.S,
+        "timeout": Units.S
     }
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "StageSystemSettings")
-        # Category A: Apply Defaults (Booleans)
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.enabled = p.bool(self.enabled, "enabled", default=True)
-        self.can_x = p.bool(self.can_x, "can_x", default=False)
-        self.can_y = p.bool(self.can_y, "can_y", default=False)
-        self.can_z = p.bool(self.can_z, "can_z", default=False)
-        self.can_r = p.bool(self.can_r, "can_r", default=False)
-        self.can_tilt_x = p.bool(self.can_tilt_x, "can_tilt_x", default=False)
+        self.default_position = p.model(StagePosition, self.default_position, "default_position",
+                                        default=StagePosition(_mode=p.mode))
+        self.can_x = p.bool(self.can_x, "can_x", default=True)
+        self.can_y = p.bool(self.can_y, "can_y", default=True)
+        self.can_z = p.bool(self.can_z, "can_z", default=True)
+        self.can_r = p.bool(self.can_r, "can_r", default=True)
+        self.can_tilt_x = p.bool(self.can_tilt_x, "can_tilt_x", default=True)
         self.can_tilt_y = p.bool(self.can_tilt_y, "can_tilt_y", default=False)
 
-        # Category C: Limits (If None, axis will be disabled during validation)
         self.x_limits = p.pair_qty(self.x_limits, "x_limits", Units.NM)
         self.y_limits = p.pair_qty(self.y_limits, "y_limits", Units.NM)
         self.z_limits = p.pair_qty(self.z_limits, "z_limits", Units.NM)
@@ -1707,82 +1752,84 @@ class StageSystemSettings:
         self.tilt_x_limits = p.pair_qty(self.tilt_x_limits, "tilt_x_limits", Units.DEG)
         self.tilt_y_limits = p.pair_qty(self.tilt_y_limits, "tilt_y_limits", Units.DEG)
 
-        # Category A: Apply Defaults (Safety Settings)
-        self.max_step_distance = p.qty(self.max_step_distance, "max_step_distance", Units.NM,
-                                       default=Q_(50000.0, Units.NM))
-        self.max_step_deg = p.qty(self.max_step_deg, "max_step_deg", Units.DEG, default=Q_(1.0, Units.DEG))
+        self.max_step_distance = p.qty(self.max_step_distance, "max_step_distance", Units.NM)
+        self.max_step_deg = p.qty(self.max_step_deg, "max_step_deg", Units.DEG)
         self.eucentric_z = p.qty(self.eucentric_z, "eucentric_z", Units.NM)
-        self.settle_time = p.qty(self.settle_time, "settle_time", Units.SEC, default=Q_(0.2, Units.SEC))
-        self.timeout = p.qty(self.timeout, "timeout", Units.SEC, default=Q_(10.0, Units.SEC))
+        self.settle_time = p.qty(self.settle_time, "settle_time", Units.S)
+        self.timeout = p.qty(self.timeout, "timeout", Units.S)
 
-    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        v = Validator(self, mode)
+        self.active_holder_id = p.id(self.active_holder_id, "active_holder_id")
+        self.available_holders = p.map_model(HolderCapabilities, self.available_holders, "available_holders",
+                                             "holder_id")
 
-        # 1. Limit Logic (Min < Max)
-        def _validate_range(lims, name):
-            if not lims: return
-            v.check(lims[0] <= lims[1], f"{name}_limits", "min > max", raw=lims,
-                    heal=lambda: setattr(self, f"{name}_limits", (lims[1], lims[0])))
+    def get_effective_limits(self, axis: str) -> Optional[Tuple["Quantity", "Quantity"]]:
+        """Merge System Limits with Active Holder Limits."""
+        sys_lims = getattr(self, f"{axis}_limits", None)
 
-        for axis in ["x", "y", "z", "r", "tilt_x", "tilt_y"]:
-            _validate_range(getattr(self, f"{axis}_limits"), axis)
+        if not self.active_holder_id or not self.available_holders:
+            return sys_lims
 
-            # 2. Consistency (Enabled -> Limits must exist)
-            is_enabled = getattr(self, f"can_{axis}")
-            has_limits = getattr(self, f"{axis}_limits") is not None
-            v.check(not (is_enabled and not has_limits), f"{axis}_safety",
-                    f"Axis {axis} enabled without limits",
-                    heal=lambda: setattr(self, f"can_{axis}", False))
+        holder = self.available_holders.get(self.active_holder_id)
+        if not holder:
+            return sys_lims
 
-        # 3. Value Checks
-        v.check_gt_zero(self.max_step_distance, "max_step_distance", unit_aware=True, reset_to=Q_(50000.0, Units.NM))
-        v.check_ge_zero(self.settle_time, "settle_time", unit_aware=True, reset_to=Q_(0.2, Units.SEC))
-        v.check_ge_zero(self.timeout, "timeout", unit_aware=True, reset_to=Q_(10.0, Units.SEC))
+        # 1. Check Capabilities
+        if axis == "tilt_x" and holder.can_tilt_x is False: return None
+        if axis == "tilt_y" and holder.can_tilt_y is False: return None
+        if axis == "r" and holder.can_rotate is False: return None
 
-        # 4. Eucentric Check
-        if self.eucentric_z is not None and self.z_limits:
-            z_min, z_max = self.z_limits
-            v.check(z_min <= self.eucentric_z <= z_max, "eucentric_z",
-                    f"eucentric_z {self.eucentric_z} outside limits",
-                    heal=lambda: setattr(self, 'eucentric_z', None))
+        # 2. Merge Limits
+        holder_lims = getattr(holder, f"{axis}_limits", None)
 
-        return v.valid
+        if sys_lims is None: return holder_lims
+        if holder_lims is None: return sys_lims
+
+        low = max(sys_lims[0], holder_lims[0])
+        high = min(sys_lims[1], holder_lims[1])
+
+        if low > high: return None
+        return (low, high)
 
     def is_safe_move(self, target: StagePosition, current: Optional[StagePosition] = None,
                      relative: bool = False, ignore_step_limit: bool = False) -> SafetyCheck:
         """
         RUNTIME CHECK: External Safety.
         Returns a SafetyCheck object (True/False + reasons) without modifying self.extra.
-
-        Checks:
-        1. Is the axis enabled? (can_x, can_tilt_x, etc.)
-        2. Is the destination within absolute limits? (x_limits, etc.)
-        3. Is the step size within dynamic limits? (max_step_distance, etc.)
-
-        Args:
-            target: The destination or delta.
-            current: The starting position (required for relative moves or step checks).
-            relative: Whether target is a delta.
-            ignore_step_limit: If True, skips max_step_distance checks (used when interpolator is active).
         """
         reasons = []
 
+        # --- 0. Resolve Active Holder (NEW) ---
+        holder = self.available_holders.get(self.active_holder_id) if (
+                    self.active_holder_id and self.available_holders) else None
+
         # --- 1. Validate Axis Availability (Intents vs Capabilities) ---
-        # If the user intends to move an axis (value is not None), that axis MUST be enabled.
+        # Checks System Capabilities AND Holder Capabilities
         axes_map = {
-            "x": self.can_x, "y": self.can_y, "z": self.can_z,
-            "r": self.can_r, "tilt_x": self.can_tilt_x, "tilt_y": self.can_tilt_y
+            "x": (self.can_x, None),
+            "y": (self.can_y, None),
+            "z": (self.can_z, None),
+            "r": (self.can_r, "can_rotate"),
+            "tilt_x": (self.can_tilt_x, "can_tilt_x"),
+            "tilt_y": (self.can_tilt_y, "can_tilt_y")
         }
 
-        for axis, is_enabled in axes_map.items():
-            if getattr(target, axis) is not None and not is_enabled:
-                reasons.append(f"Movement requested on disabled axis: '{axis}'")
+        for axis, (sys_enabled, holder_flag_name) in axes_map.items():
+            if getattr(target, axis) is not None:
+                # Check System
+                if not sys_enabled:
+                    reasons.append(f"Movement requested on disabled axis: '{axis}'")
 
-        # If we already failed basic capability checks, return early to avoid math errors
+                # Check Holder (NEW)
+                if holder and holder_flag_name:
+                    holder_enabled = getattr(holder, holder_flag_name, True)
+                    if holder_enabled is False:
+                        reasons.append(f"Axis '{axis}' disabled by active holder '{self.active_holder_id}'")
+
+        # If we already failed basic capability checks, return early
         if reasons:
             return SafetyCheck(allowed=False, reasons=reasons)
 
-        # --- 2. Resolve Absolute Target & Step Vector ---
+        # --- 2. Resolve Absolute Target & Step Vector (UNCHANGED) ---
         abs_target = target
         step_vector = None
 
@@ -1790,7 +1837,7 @@ class StageSystemSettings:
             if current is None:
                 return SafetyCheck.failure("Cannot perform relative move without current position")
 
-            # Check if we have a valid starting point for all requested deltas
+            # Check if we have a valid starting point
             for axis in ["x", "y", "z", "r", "tilt_x", "tilt_y"]:
                 if getattr(target, axis) is not None and getattr(current, axis) is None:
                     return SafetyCheck.failure(f"Relative move on '{axis}' impossible: current position unknown.")
@@ -1798,67 +1845,76 @@ class StageSystemSettings:
             abs_target = current + target
             step_vector = target
         else:
-            # Absolute move
             if current:
                 step_vector = target - current
-            # If current is None, we can still check absolute limits, but skip step checks
 
         # --- 3. Check Static Limits (Boundaries) ---
-        def check_bound(val, lims, name):
+        def check_bound(val, axis_name):
+            # CHANGED: Use get_effective_limits instead of direct self.limits
+            lims = self.get_effective_limits(axis_name)
+
             if val is not None and lims:
                 if not (lims[0] <= val <= lims[1]):
-                    reasons.append(f"{name} target {val} outside limits {lims}")
+                    reasons.append(f"{axis_name} target {val} outside effective limits {lims}")
 
-        check_bound(abs_target.x, self.x_limits, "x")
-        check_bound(abs_target.y, self.y_limits, "y")
-        check_bound(abs_target.z, self.z_limits, "z")
-        check_bound(abs_target.r, self.r_limits, "r")
-        check_bound(abs_target.tilt_x, self.tilt_x_limits, "tilt_x")
-        check_bound(abs_target.tilt_y, self.tilt_y_limits, "tilt_y")
+        check_bound(abs_target.x, "x")
+        check_bound(abs_target.y, "y")
+        check_bound(abs_target.z, "z")
+        check_bound(abs_target.r, "r")
+        check_bound(abs_target.tilt_x, "tilt_x")
+        check_bound(abs_target.tilt_y, "tilt_y")
 
-        # --- 4. Check Dynamic Limits (Step Size) ---
+        # --- 4. Check Dynamic Limits (Step Size) (UNCHANGED) ---
         if not ignore_step_limit and step_vector is not None:
             # XY Euclidian Distance
             if step_vector.x is not None or step_vector.y is not None:
                 dx = step_vector.x if step_vector.x is not None else Q_(0, Units.NM)
                 dy = step_vector.y if step_vector.y is not None else Q_(0, Units.NM)
                 distance = (dx.to(Units.NM).magnitude ** 2 + dy.to(Units.NM).magnitude ** 2) ** 0.5
-                max_dist_nm = self.max_step_distance.to(Units.NM).magnitude
 
-                if distance > max_dist_nm:
-                    reasons.append(f"XY step {distance:.1f}nm exceeds limit {max_dist_nm:.1f}nm")
+                if self.max_step_distance:
+                    max_dist_nm = self.max_step_distance.to(Units.NM).magnitude
+                    if distance > max_dist_nm:
+                        reasons.append(f"XY step {distance:.1f}nm exceeds limit {max_dist_nm:.1f}nm")
 
             # Z Step Limit
-            if step_vector.z is not None:
+            if step_vector.z is not None and self.max_step_distance:
                 d_z = abs(step_vector.z.to(Units.NM).magnitude)
                 max_dist_nm = self.max_step_distance.to(Units.NM).magnitude
-
                 if d_z > max_dist_nm:
                     reasons.append(f"Z step {d_z:.1f}nm exceeds limit {max_dist_nm:.1f}nm")
 
             # Tilt Step Limits
-            if step_vector.tilt_x is not None:
-                d_tilt = abs(step_vector.tilt_x)
-                if d_tilt > self.max_step_deg:
-                    reasons.append(f"Tilt X step {d_tilt} exceeds limit {self.max_step_deg}")
+            if self.max_step_deg:
+                if step_vector.tilt_x is not None:
+                    d_tilt = abs(step_vector.tilt_x.to(Units.DEG).magnitude)
+                    if d_tilt > self.max_step_deg.to(Units.DEG).magnitude:
+                        reasons.append(f"Tilt X step {d_tilt} exceeds limit {self.max_step_deg}")
 
-            if step_vector.tilt_y is not None:
-                d_tilt = abs(step_vector.tilt_y)
-                if d_tilt > self.max_step_deg:
-                    reasons.append(f"Tilt Y step {d_tilt} exceeds limit {self.max_step_deg}")
+                if step_vector.tilt_y is not None:
+                    d_tilt = abs(step_vector.tilt_y.to(Units.DEG).magnitude)
+                    if d_tilt > self.max_step_deg.to(Units.DEG).magnitude:
+                        reasons.append(f"Tilt Y step {d_tilt} exceeds limit {self.max_step_deg}")
 
         return SafetyCheck(allowed=(len(reasons) == 0), reasons=reasons)
 
     def to_dict(self) -> dict:
-        return _auto_to_dict(self, unit_map=self._UNITS, key_map=self._KEYS)
+        return _auto_to_dict(self, unit_map=self._UNITS)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "StageSystemSettings":
         return _auto_from_dict(StageSystemSettings, d, mode, alias_map={
-            "x_limits": "x_limits_nm", "y_limits": "y_limits_nm", "z_limits": "z_limits_nm",
-            "r_limits": "r_limits_deg", "tilt_x_limits": "tilt_x_limits_deg", "tilt_y_limits": "tilt_y_limits_deg",
-            "max_step_distance": "max_step_nm", "max_step_deg": "max_step_angle",
-            "eucentric_z": "eucentric_z_nm", "settle_time": "settle_time_s", "timeout": "timeout_s"
+            "x_limits": "x_limits_nm",
+            "y_limits": "y_limits_nm",
+            "z_limits": "z_limits_nm",
+            "r_limits": "r_limits_deg",
+            "tilt_x_limits": "tilt_x_limits_deg",
+            "tilt_y_limits": "tilt_y_limits_deg",
+            "max_step_distance": "max_step_distance_nm",
+            "max_step_deg": "max_step_deg",
+            "eucentric_z": "eucentric_z_nm",
+            "settle_time": "settle_time_s",
+            "timeout": "timeout_s"
         })
 
 @dataclass
@@ -1893,12 +1949,17 @@ class BeamSettings:
            leaving voltage and alignments untouched.
     """
     voltage: Optional["Quantity"] = None
+    mode: Optional[str] = None  # "TEM", "STEM"
+    probe_mode: Optional[str] = None  # "Microprobe", "Nanoprobe"
     beam_current: Optional["Quantity"] = None
+    emission_current: Optional["Quantity"] = None
     spot_size: Optional[int] = None
     convergence_angle: Optional["Quantity"] = None
+    is_blanked: Optional[bool] = None
 
     # Gun/Condenser alignments
     beam_shift: Optional[Point] = None
+    beam_tilt: Optional[Point] = None
     condenser_stigmation: Optional[Point] = None  # Renamed from 'stigmation'
     gun_tilt: Optional[Point] = None  # Added missing alignment
 
@@ -1908,27 +1969,36 @@ class BeamSettings:
     _UNITS = {
         "voltage": Units.KV,
         "beam_current": Units.NA,
+        "emission_current": Units.UA,
         "convergence_angle": Units.MRAD
     }
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "BeamSettings")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.voltage = p.qty(self.voltage, "voltage", Units.KV)
+        self.mode = p.str(self.mode, "mode")
+        self.probe_mode = p.str(self.probe_mode, "probe_mode")
         self.beam_current = p.qty(self.beam_current, "beam_current", Units.NA)
+        self.emission_current = p.qty(self.emission_current, "emission_current", Units.UA)
         self.spot_size = p.int(self.spot_size, "spot_size")
         self.convergence_angle = p.qty(self.convergence_angle, "convergence_angle", Units.MRAD)
-
+        self.is_blanked = p.bool(self.is_blanked, "is_blanked")
         self.beam_shift = p.model(Point, self.beam_shift, "beam_shift")
+        self.beam_tilt = p.model(Point, self.beam_tilt, "beam_tilt")
         self.condenser_stigmation = p.model(Point, self.condenser_stigmation, "condenser_stigmation")
         self.gun_tilt = p.model(Point, self.gun_tilt, "gun_tilt")
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
         v.check_nested(self.beam_shift)
+        v.check_nested(self.beam_tilt)
+        v.check_nested(self.condenser_stigmation)
+        v.check_nested(self.gun_tilt)
 
         v.check_ge_zero(self.convergence_angle, "convergence_angle", unit_aware=True, reset_to=None)
         v.check_ge_zero(self.voltage, "voltage", unit_aware=True, reset_to=None)
         v.check_ge_zero(self.beam_current, "beam_current", unit_aware=True, reset_to=None)
+        v.check_ge_zero(self.emission_current, "emission_current", unit_aware=True, reset_to=None)
         v.check_ge_zero(self.spot_size, "spot_size", reset_to=None)
 
         return v.valid
@@ -1939,7 +2009,7 @@ class BeamSettings:
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "BeamSettings":
         return _auto_from_dict(BeamSettings, d, mode, alias_map={
-            "voltage": "voltage_kv", "beam_current": "beam_current_na",
+            "voltage": "voltage_kv", "beam_current": "beam_current_na", "emission_current": "emission_current_ua",
             "convergence_angle": "convergence_angle_mrad"
         })
 
@@ -1972,6 +2042,8 @@ class BeamSystemSettings:
     beam_current_limits: Optional[Tuple["Quantity", "Quantity"]] = None
     spot_size_limits: Optional[Tuple[int, int]] = None
     convergence_angle_limits: Optional[Tuple["Quantity", "Quantity"]] = None
+    available_modes: Optional[List[str]] = None
+    available_probe_modes: Optional[List[str]] = None
 
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
@@ -1983,19 +2055,32 @@ class BeamSystemSettings:
     }
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "BeamSystemSettings")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.enabled = p.bool(self.enabled, "enabled", default=True)
         self.spot_size_limits = p.pair_int(self.spot_size_limits, "spot_size_limits")
         self.voltage_limits = p.pair_qty(self.voltage_limits, "voltage_limits", Units.KV)
         self.beam_current_limits = p.pair_qty(self.beam_current_limits, "beam_current_limits", Units.NA)
         self.convergence_angle_limits = p.pair_qty(self.convergence_angle_limits, "convergence_angle_limits",
                                                    Units.MRAD)
-        # Category B: Structural Default
         self.default_beam = p.model(BeamSettings, self.default_beam, "default_beam", default=BeamSettings(_mode=p.mode))
+        self.available_modes = p.list_str(self.available_modes, "available_modes")
+        self.available_probe_modes = p.list_str(self.available_probe_modes, "available_probe_modes")
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
         v.check_nested(self.default_beam)
+        if self.default_beam:
+            if self.available_modes and self.default_beam.mode:
+                v.check(self.default_beam.mode in self.available_modes,
+                        "default_beam.mode",
+                        f"Default mode '{self.default_beam.mode}' not in {self.available_modes}",
+                        heal=lambda: setattr(self.default_beam, 'mode', self.available_modes[0]))
+
+            if self.available_probe_modes and self.default_beam.probe_mode:
+                v.check(self.default_beam.probe_mode in self.available_probe_modes,
+                        "default_beam.probe_mode",
+                        f"Default probe '{self.default_beam.probe_mode}' not in {self.available_probe_modes}",
+                        heal=lambda: setattr(self.default_beam, 'probe_mode', self.available_probe_modes[0]))
 
         def _check_range(rng, name):
             if not rng: return
@@ -2027,6 +2112,13 @@ class BeamSystemSettings:
         Runtime Gatekeeper: Checks if a target beam configuration respects system limits.
         """
         reasons = []
+        if target.mode and self.available_modes:
+            if target.mode not in self.available_modes:
+                reasons.append(f"Mode '{target.mode}' not supported {self.available_modes}")
+
+        if target.probe_mode and self.available_probe_modes:
+            if target.probe_mode not in self.available_probe_modes:
+                reasons.append(f"Probe mode '{target.probe_mode}' not supported {self.available_probe_modes}")
 
         def _check(val, limit_tuple, name):
             if val is not None and limit_tuple is not None:
@@ -2089,18 +2181,14 @@ class ProjectionSettings:
              associated fields (e.g. `camera_length`) become mandatory.
     """
     optical_mode: Optional[str] = None  # "IMAGING", "DIFFRACTION", "LAD"
-
-    # Imaging Parameters (IMAGING mode)
     magnification: Optional[int] = None
-    defocus: Optional["Quantity"] = None
-    objective_stigmation: Optional[Point] = None
-    image_shift: Optional[Point] = None
-
-    # Diffraction Parameters (DIFFRACTION mode)
     camera_length: Optional["Quantity"] = None
-    diffraction_shift: Optional[Point] = None
-
+    defocus: Optional["Quantity"] = None
     screen_position: Optional[str] = None  # "UP", "DOWN"
+    objective_stigmation: Optional[Point] = None
+    diffraction_stigmation: Optional[Point] = None
+    image_shift: Optional[Point] = None
+    diffraction_shift: Optional[Point] = None
 
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
@@ -2111,14 +2199,14 @@ class ProjectionSettings:
     }
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "ProjectionSettings")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.optical_mode = p.str(self.optical_mode, "optical_mode")
         self.magnification = p.int(self.magnification, "magnification")
-        self.defocus = p.qty(self.defocus, "defocus", Units.NM)
         self.camera_length = p.qty(self.camera_length, "camera_length", Units.MM)
+        self.defocus = p.qty(self.defocus, "defocus", Units.NM)
         self.screen_position = p.str(self.screen_position, "screen_position")
-
         self.objective_stigmation = p.model(Point, self.objective_stigmation, "objective_stigmation")
+        self.diffraction_stigmation = p.model(Point, self.diffraction_stigmation, "diffraction_stigmation")
         self.image_shift = p.model(Point, self.image_shift, "image_shift")
         self.diffraction_shift = p.model(Point, self.diffraction_shift, "diffraction_shift")
 
@@ -2127,6 +2215,8 @@ class ProjectionSettings:
 
         v.check_nested(self.objective_stigmation)
         v.check_nested(self.image_shift)
+        v.check_nested(self.diffraction_shift)
+        v.check_nested(self.diffraction_stigmation)
 
         # --- NEW VALIDATION LOGIC ---
         v.check_ge_zero(self.camera_length, "camera_length", unit_aware=True, reset_to=None)
@@ -2175,6 +2265,7 @@ class ProjectionSystemSettings:
     """
     enabled: Optional[bool] = None
     default_projection: Optional[ProjectionSettings] = None
+    available_optical_modes: Optional[List[str]] = None
 
     # Limits
     camera_length_limits: Optional[Tuple["Quantity", "Quantity"]] = None
@@ -2190,17 +2281,22 @@ class ProjectionSystemSettings:
     }
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "ProjectionSystemSettings")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.enabled = p.bool(self.enabled, "enabled", default=True)
         self.default_projection = p.model(ProjectionSettings, self.default_projection, "default_projection",
                                           default=ProjectionSettings(_mode=p.mode))
-
+        self.available_optical_modes = p.list_str(self.available_optical_modes, "available_optical_modes")
         self.camera_length_limits = p.pair_qty(self.camera_length_limits, "camera_length_limits", Units.MM)
         self.magnification_limits = p.pair_int(self.magnification_limits, "magnification_limits")
         self.defocus_limits = p.pair_qty(self.defocus_limits, "defocus_limits", Units.NM)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
+        if self.default_projection and self.default_projection.optical_mode:
+            if self.available_optical_modes:
+                v.check(self.default_projection.optical_mode in self.available_optical_modes,
+                        "default_projection.optical_mode",
+                        f"Default mode '{self.default_projection.optical_mode}' not in {self.available_optical_modes}")
         # Standard range logic (simplified for brevity)
         if self.camera_length_limits:
             mn, mx = self.camera_length_limits
@@ -2209,6 +2305,11 @@ class ProjectionSystemSettings:
 
     def is_safe_projection(self, target: ProjectionSettings) -> SafetyCheck:
         reasons = []
+
+        if target.optical_mode and self.available_optical_modes:
+            if target.optical_mode not in self.available_optical_modes:
+                reasons.append(
+                    f"Optical mode '{target.optical_mode}' not supported. Available: {self.available_optical_modes}")
 
         # Check Diffraction Limits
         if target.optical_mode == "DIFFRACTION" and target.camera_length is not None:
@@ -2285,14 +2386,15 @@ class DetectorSettings:
            Values defined here override the persistent camera state for that one shot.
     """
     detector_id: Optional[str] = None
+    inserted: Optional[bool] = None
     exposure: Optional["Quantity"] = None
     binning_index: Optional[int] = None
     binning_xy: Optional[Tuple[int, int]] = None
     roi: Optional[ROI] = None
-    frame_integration: Optional[int] = None
     gain_index: Optional[int] = None
     offset_index: Optional[int] = None
     digital_rotation: Optional["Quantity"] = None
+    frame_integration: Optional[int] = None
     frame_rate: Optional["Quantity"] = None  # e.g. 40 Hz
     total_frames: Optional[int] = None  # e.g. 40 frames
 
@@ -2311,8 +2413,9 @@ class DetectorSettings:
     }
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "DetectorSettings")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.detector_id = p.id(self.detector_id, "detector_id")
+        self.inserted = p.bool(self.inserted, "inserted")
         self.binning_index = p.int(self.binning_index, "binning_index")
         self.binning_xy = p.pair_int(self.binning_xy, "binning_xy")
         self.frame_rate = p.qty(self.frame_rate, "frame_rate", Units.HZ)
@@ -2322,10 +2425,7 @@ class DetectorSettings:
         self.offset_index = p.int(self.offset_index, "offset_index")
         self.digital_rotation = p.qty(self.digital_rotation, "digital_rotation", Units.DEG)
         self.exposure = p.qty(self.exposure, "exposure", Units.MS)
-        # ROI is preserved as None if missing (tristate)
         self.roi = p.model(ROI, self.roi, "roi", default=None)
-
-        # --- NEW PARSERS ---
         self.readout_mode = p.str(self.readout_mode, "readout_mode")
         self.shutter_mode = p.str(self.shutter_mode, "shutter_mode")
         self.save_frames = p.bool(self.save_frames, "save_frames")
@@ -2396,6 +2496,7 @@ class DetectorCapabilities:
         can_digital_rotation (Optional[bool]): Supports hardware rotation.
         digital_rotation_min, digital_rotation_max (Optional[Quantity]): Rotation limits.
     """
+    can_insert: Optional[bool] = None
     can_binning: Optional[bool] = None
     binning_index_min: Optional[int] = None
     binning_index_max: Optional[int] = None
@@ -2432,7 +2533,8 @@ class DetectorCapabilities:
     }
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "DetectorCapabilities")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
+        self.can_insert = p.bool(self.can_insert, "can_insert", default=False)
         self.can_binning = p.bool(self.can_binning, "can_binning")
         self.can_gain = p.bool(self.can_gain, "can_gain")
         self.can_offset = p.bool(self.can_offset, "can_offset")
@@ -2597,6 +2699,10 @@ class DetectorCapabilities:
                 if w > max_w or h > max_h:
                     reasons.append(f"ROI size {w}x{h} exceeds limit {self.roi_size_max}.")
 
+        if settings.inserted is not None and self.can_insert is False:
+            # If user tries to change insertion state on a fixed detector
+            reasons.append(f"Detector does not support insertion/retraction (can_insert=False).")
+
         return SafetyCheck(allowed=(len(reasons) == 0), reasons=reasons)
 
     def to_dict(self) -> dict:
@@ -2641,7 +2747,7 @@ class DetectorSystemSettings:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "DetectorSystemSettings")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.enabled = p.bool(self.enabled, "enabled", default=True)
         self.default_detector_id = p.id(self.default_detector_id, "default_detector_id")
         self.available_detector_ids = list(
@@ -2728,6 +2834,7 @@ class ScanSettings:
            Any field set to None retains the previous value.
     """
     scan_mode: Optional[str] = None
+    active: Optional[bool] = None
 
     # --- ADDED: Grid Dimensions ---
     width_px: Optional[int] = None
@@ -2749,13 +2856,11 @@ class ScanSettings:
     }
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "ScanSettings")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.scan_mode = p.str(self.scan_mode, "scan_mode")
-
-        # --- ADDED: Parsers ---
+        self.active = p.bool(self.active, "active")
         self.width_px = p.int(self.width_px, "width_px")
         self.height_px = p.int(self.height_px, "height_px")
-
         self.pixel_dwell_time = p.qty(self.pixel_dwell_time, "pixel_dwell_time", Units.US)
         self.flyback_time = p.qty(self.flyback_time, "flyback_time", Units.US)
         self.scan_rotation = p.qty(self.scan_rotation, "scan_rotation", Units.DEG)
@@ -2816,6 +2921,7 @@ class ScanSystemSettings:
             None Behavior: Preserved as None (Unlimited).
     """
     enabled: Optional[bool] = None
+    default_scan: Optional[ScanSettings] = None
 
     # --- Capabilities ---
     available_scan_modes: Optional[List[str]] = None  # e.g. ["SPOT", "FULL_FRAME"]
@@ -2835,10 +2941,11 @@ class ScanSystemSettings:
     }
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "ScanSystemSettings")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.enabled = p.bool(self.enabled, "enabled", default=True)
+        self.default_scan = p.model(ScanSettings, self.default_scan, "default_scan",
+                                    default=ScanSettings(_mode=p.mode))
         self.available_scan_modes = p.list_str(self.available_scan_modes, "available_scan_modes")
-
         self.pixel_dwell_time_limits = p.pair_qty(self.pixel_dwell_time_limits, "pixel_dwell_time_limits", Units.US)
         self.flyback_time_limits = p.pair_qty(self.flyback_time_limits, "flyback_time_limits", Units.US)
         self.scan_rotation_limits = p.pair_qty(self.scan_rotation_limits, "scan_rotation_limits", Units.DEG)
@@ -2941,11 +3048,10 @@ class VacuumSettings:
     }
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "VacuumSettings")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.column_valve_state = p.str(self.column_valve_state, "column_valve_state")
         self.gun_valve_state = p.str(self.gun_valve_state, "gun_valve_state")
         self.turbo_pump_state = p.str(self.turbo_pump_state, "turbo_pump_state")
-
         self.column_pressure = p.qty(self.column_pressure, "column_pressure", Units.PA)
         self.gun_pressure = p.qty(self.gun_pressure, "gun_pressure", Units.PA)
         self.buffer_tank_pressure = p.qty(self.buffer_tank_pressure, "buffer_tank_pressure", Units.PA)
@@ -2970,7 +3076,7 @@ class VacuumSettings:
         })
 
 @dataclass
-class Aperture:
+class ApertureSettings:
     """
     Physical aperture status or a request to modify insertion/size.
 
@@ -2998,15 +3104,17 @@ class Aperture:
     aperture_id: Optional[str] = None
     inserted: Optional[bool] = None
     size_index: Optional[int] = None
+    size_label: Optional[str] = None
     position: Optional[Point] = None
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.LENIENT, repr=False)
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "Aperture")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.aperture_id = p.id(self.aperture_id, "aperture_id")
         self.inserted = p.bool(self.inserted, "inserted")
         self.size_index = p.int(self.size_index, "size_index")
+        self.size_label = p.str(self.size_label, "size_label")
         self.position = p.model(Point, self.position, "position")
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
@@ -3024,10 +3132,157 @@ class Aperture:
         return _auto_to_dict(self)
 
     @staticmethod
-    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "Aperture":
-        return _auto_from_dict(Aperture, d, mode, alias_map={
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "ApertureSettings":
+        return _auto_from_dict(ApertureSettings, d, mode, alias_map={
             "aperture_id": "id"
         })
+
+@dataclass
+class ApertureCapabilities:
+    """
+    Hardware limits and features for a specific aperture mechanism.
+    """
+    aperture_id: Optional[str] = None
+
+    # --- Mechanical Features ---
+    can_insert: Optional[bool] = None  # False = Permanently in/out (no motor)
+    can_align: Optional[bool] = None  # False = Fixed position (no XY motors)
+    can_select_size: Optional[bool] = None  # False = Fixed hole size
+
+    # --- Configuration ---
+    # List of human-readable labels for the holes (e.g. ["10 um", "50 um"])
+    # The valid size_index range is [0, len(available_sizes) - 1]
+    available_sizes: Optional[List[str]] = None
+
+    extra: Extras = field(default_factory=Extras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+
+    def __post_init__(self):
+        p = FieldParser(self, self._mode, self.__class__.__name__)
+        self.aperture_id = p.id(self.aperture_id, "aperture_id")
+
+        # Default features to True unless explicitly disabled
+        self.can_insert = p.bool(self.can_insert, "can_insert", default=True)
+        self.can_align = p.bool(self.can_align, "can_align", default=True)
+        self.can_select_size = p.bool(self.can_select_size, "can_select_size", default=True)
+
+        self.available_sizes = p.list_str(self.available_sizes, "available_sizes")
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        return True  # Basic typing handled by parser
+
+    def to_dict(self) -> dict:
+        return _auto_to_dict(self)
+
+    @staticmethod
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "ApertureCapabilities":
+        return _auto_from_dict(ApertureCapabilities, d, mode)
+
+
+@dataclass
+class ApertureSystemSettings:
+    """
+    Registry of installed apertures and their capabilities.
+    """
+    enabled: Optional[bool] = None
+
+    # Registry: Map ID -> Capabilities (Hardware limits)
+    capabilities_by_id: Optional[Dict[str, ApertureCapabilities]] = None
+
+    # --- NEW: Registry of Default States ---
+    # Map ID -> Default State (e.g. {"condenser": Aperture(size_index=2)})
+    defaults_by_id: Optional[Dict[str, ApertureSettings]] = None
+
+    # Helper list for quick lookups
+    available_aperture_ids: Optional[List[str]] = None
+
+    extra: Extras = field(default_factory=Extras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+
+    def __post_init__(self):
+        p = FieldParser(self, self._mode, self.__class__.__name__)
+        self.enabled = p.bool(self.enabled, "enabled", default=True)
+
+        # Parse Capabilities Map
+        self.capabilities_by_id = p.map_model(ApertureCapabilities, self.capabilities_by_id,
+                                              "capabilities_by_id", id_field="aperture_id")
+
+        # --- NEW: Parse Defaults Map ---
+        self.defaults_by_id = p.map_model(ApertureSettings, self.defaults_by_id,
+                                          "defaults_by_id", id_field="aperture_id")
+
+        self.available_aperture_ids = p.list_str(self.available_aperture_ids, "available_aperture_ids")
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        v = Validator(self, mode)
+        v.check_nested_map(self.capabilities_by_id)
+
+        # --- NEW: Validate Defaults Integrity ---
+        v.check_nested_map(self.defaults_by_id)
+
+        # Consistency Check: Ensure everything mentioned exists in capabilities
+        if self.available_aperture_ids:
+            known = set(self.capabilities_by_id.keys()) if self.capabilities_by_id else set()
+
+            # 1. Check Availability List
+            for aid in self.available_aperture_ids:
+                if aid not in known:
+                    v.check(False, f"available_aperture_ids.{aid}",
+                            f"ID '{aid}' listed in available_ids but missing from capabilities")
+
+            # 2. Check Defaults (NEW)
+            if self.defaults_by_id:
+                for aid in self.defaults_by_id.keys():
+                    if aid not in known:
+                        v.check(False, f"defaults_by_id.{aid}",
+                                f"Default settings defined for unknown aperture ID '{aid}'")
+
+        return v.valid
+
+    def is_supported(self, target: ApertureSettings) -> SafetyCheck:
+        """
+        Validates if the target aperture state is supported by the hardware.
+        """
+        reasons = []
+
+        # 1. ID Check
+        if not target.aperture_id:
+            return SafetyCheck.failure("Target aperture has no ID")
+
+        if not self.capabilities_by_id or target.aperture_id not in self.capabilities_by_id:
+            # If we have a registry, and this ID isn't in it:
+            if self.capabilities_by_id is not None:
+                reasons.append(
+                    f"Aperture ID '{target.aperture_id}' unknown. Available: {list(self.capabilities_by_id.keys())}")
+            return SafetyCheck(allowed=False, reasons=reasons)
+
+        caps = self.capabilities_by_id[target.aperture_id]
+
+        # 2. Capability Checks
+        if target.inserted is not None and caps.can_insert is False:
+            reasons.append(f"Aperture '{target.aperture_id}' does not support insertion/retraction.")
+
+        if target.position is not None and caps.can_align is False:
+            reasons.append(f"Aperture '{target.aperture_id}' does not support alignment (fixed position).")
+
+        if target.size_index is not None:
+            if caps.can_select_size is False:
+                reasons.append(f"Aperture '{target.aperture_id}' has fixed size.")
+            elif caps.available_sizes:
+                max_idx = len(caps.available_sizes) - 1
+                if target.size_index < 0 or target.size_index > max_idx:
+                    reasons.append(
+                        f"Size index {target.size_index} out of range for '{target.aperture_id}' (Max: {max_idx})")
+
+        return SafetyCheck(allowed=(len(reasons) == 0), reasons=reasons)
+
+    def to_dict(self) -> dict:
+        return _auto_to_dict(self)
+
+    @staticmethod
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "ApertureSystemSettings":
+        return _auto_from_dict(ApertureSystemSettings, d, mode)
+
 
 @dataclass
 class MicroscopeState:
@@ -3048,7 +3303,7 @@ class MicroscopeState:
         projection (Optional[ProjectionSettings]): Current imaging state.
         scan (Optional[ScanSettings]): Current raster state.
         vacuum (Optional[VacuumSettings]): Current vacuum state.
-        apertures (Optional[Dict[str, Aperture]]): State of all apertures.
+        apertures (Optional[Dict[str, ApertureSettings]]): State of all apertures.
         detectors (Optional[Dict[str, DetectorSettings]]): State of all cameras.
         active_detector_ids (Optional[List[str]]): List of currently active cameras.
         primary_detector_id (Optional[str]): The main camera in use.
@@ -3060,7 +3315,7 @@ class MicroscopeState:
     projection: Optional[ProjectionSettings] = None  # --- ADDED ---
     scan: Optional[ScanSettings] = None
     vacuum: Optional[VacuumSettings] = None
-    apertures: Optional[Dict[str, Aperture]] = None
+    apertures: Optional[Dict[str, ApertureSettings]] = None
     detectors: Optional[Dict[str, DetectorSettings]] = None
     active_detector_ids: Optional[List[str]] = None
     primary_detector_id: Optional[str] = None
@@ -3068,23 +3323,21 @@ class MicroscopeState:
     _mode: ParseMode = field(default=ParseMode.LENIENT, repr=False)
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "MicroscopeState")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.timestamp = p.str(self.timestamp, "timestamp",
                                default=datetime.datetime.now(datetime.timezone.utc).isoformat())
         self.mode = p.str(self.mode, "mode")
-        self.primary_detector_id = p.id(self.primary_detector_id, "primary_detector_id")
-        self.active_detector_ids = p.list_str(self.active_detector_ids, "active_detector_ids")
-        # Category B: Structural Defaults
         self.stage_position = p.model(StagePosition, self.stage_position, "stage_position",
                                       default=StagePosition(_mode=p.mode))
         self.beam = p.model(BeamSettings, self.beam, "beam", default=BeamSettings(_mode=p.mode))
         self.projection = p.model(ProjectionSettings, self.projection, "projection",
                                   default=ProjectionSettings(_mode=p.mode))
         self.scan = p.model(ScanSettings, self.scan, "scan", default=ScanSettings(_mode=p.mode))
-        self.vacuum = p.model(VacuumSettings, self.vacuum, "vacuum", default=VacuumSettings(_mode=p.mode))  # <--- NEW
-
-        self.apertures = p.map_model(Aperture, self.apertures, "apertures", "aperture_id")
+        self.vacuum = p.model(VacuumSettings, self.vacuum, "vacuum", default=VacuumSettings(_mode=p.mode))
+        self.apertures = p.map_model(ApertureSettings, self.apertures, "apertures", "aperture_id")
         self.detectors = p.map_model(DetectorSettings, self.detectors, "detectors", "detector_id")
+        self.active_detector_ids = p.list_str(self.active_detector_ids, "active_detector_ids")
+        self.primary_detector_id = p.id(self.primary_detector_id, "primary_detector_id")
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
@@ -3092,7 +3345,7 @@ class MicroscopeState:
         v.check_nested(self.beam)
         v.check_nested(self.projection)
         v.check_nested(self.scan)
-        v.check_nested(self.vacuum)  # <--- NEW
+        v.check_nested(self.vacuum)
         v.check_nested_map(self.apertures)
         v.check_nested_map(self.detectors)
 
@@ -3148,7 +3401,7 @@ class MicroscopeImageMetadata:
     _mode: ParseMode = field(default=ParseMode.LENIENT, repr=False)
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "MicroscopeImageMetadata")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.version = p.str(self.version, "version", default=SCHEMA_VERSION)
         self.created_at = p.str(self.created_at, "created_at",
                                 default=datetime.datetime.now(datetime.timezone.utc).isoformat())
@@ -3336,7 +3589,7 @@ class ImageOutputSettings:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False, compare=False)
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "ImageOutputSettings")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         _fmt = p.str(self.file_format, "file_format")
         self.file_format = (_fmt.lower() if _fmt else "tiff")
         self.path = p.str(self.path, "path")
@@ -3386,7 +3639,7 @@ class SystemInfo:
     _mode: ParseMode = field(default=ParseMode.LENIENT, repr=False, compare=False)
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "SystemInfo")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.name = p.str(self.name, "name", default="Unknown")
         self.ip_address = p.str(self.ip_address, "ip_address", default="Unknown")
         self.manufacturer = p.str(self.manufacturer, "manufacturer", default="Unknown")
@@ -3437,25 +3690,25 @@ class SystemSettings:
     projection_system: Optional[ProjectionSystemSettings] = None
     scan_system: Optional[ScanSystemSettings] = None  # <--- NEW
     detector_system: Optional[DetectorSystemSettings] = None
+    aperture_system: Optional[ApertureSystemSettings] = None
     info: Optional[SystemInfo] = None
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False, compare=False)
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "SystemSettings")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.stage_system = p.model(StageSystemSettings, self.stage_system, "stage_system",
                                     default=StageSystemSettings(_mode=p.mode))
         self.beam_system = p.model(BeamSystemSettings, self.beam_system, "beam_system",
                                    default=BeamSystemSettings(_mode=p.mode))
         self.projection_system = p.model(ProjectionSystemSettings, self.projection_system, "projection_system",
                                          default=ProjectionSystemSettings(_mode=p.mode))
-
-        # --- NEW PARSER ---
         self.scan_system = p.model(ScanSystemSettings, self.scan_system, "scan_system",
                                    default=ScanSystemSettings(_mode=p.mode))
-
         self.detector_system = p.model(DetectorSystemSettings, self.detector_system, "detector_system",
                                        default=DetectorSystemSettings(_mode=p.mode))
+        self.aperture_system = p.model(ApertureSystemSettings, self.aperture_system, "aperture_system",
+                                       default=ApertureSystemSettings(_mode=p.mode))
         self.info = p.model(SystemInfo, self.info, "info", default=SystemInfo(_mode=p.mode))
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
@@ -3498,7 +3751,7 @@ class MicroscopeSettings:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False, compare=False)
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "MicroscopeSettings")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.system = p.model(SystemSettings, self.system, "system", default=SystemSettings(_mode=p.mode))
         self.image = p.model(ImageOutputSettings, self.image, "image", default=ImageOutputSettings(_mode=p.mode))
         self.protocol = p.dict(self.protocol, "protocol", default={"name": "demo"})
@@ -3555,7 +3808,7 @@ class StageMoveRequest:
     _UNITS = {"settle_time": Units.SEC}
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "StageMoveRequest")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.relative = p.bool(self.relative, "relative", default=False)
         self.drive_type = p.str(self.drive_type, "drive_type", default=StageDriveType.DEFAULT.value)
         self.backlash_correction = p.bool(self.backlash_correction, "backlash_correction", default=True)
@@ -3618,7 +3871,7 @@ class StageControlRequest:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "StageControlRequest")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.action = p.str(self.action, "action")
         self.axes = p.list_str(self.axes, "axes")
 
@@ -3669,15 +3922,12 @@ class DetectorControlRequest:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "DetectorControlRequest")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.detector_id = p.id(self.detector_id, "detector_id")
         self.target = p.model(DetectorSettings, self.target, "target", default=DetectorSettings(_mode=p.mode))
         self.action = p.str(self.action, "action")
-
-        # Sync: If settings has an ID but request doesn't, bubble it up
         if self.target.detector_id and not self.detector_id:
             self.detector_id = self.target.detector_id
-        # Sync: If request has ID, push it down to settings for consistency
         elif self.detector_id and not self.target.detector_id:
             self.target.detector_id = self.detector_id
 
@@ -3719,17 +3969,25 @@ class BeamControlRequest:
             None Behavior: Validation Error (Mandatory).
     """
     target: Optional[BeamSettings] = None
+    action: Optional[str] = None  # NEW: "ALIGN", "DEGAUSS", "NORMALIZE"
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "BeamControlRequest")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.target = p.model(BeamSettings, self.target, "target", default=BeamSettings(_mode=p.mode))
+        self.action = p.str(self.action, "action")
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
-        v.check_nested(self.target)
-        v.check_has_intent(self.target, "empty_target", "Beam request has no parameters set")
+        if self.target:
+            v.check_nested(self.target)
+
+        # Valid if it has a Target (Settings) OR an Action (Verb)
+        has_intent = (self.target is not None) or (self.action is not None)
+        has_intent = has_intent or _has_actionable_extras(self.extra)
+        v.check(has_intent, "empty", "Request must have settings (target) or an action")
+
         return v.valid
 
     def to_dict(self) -> dict:
@@ -3753,23 +4011,27 @@ class ProjectionControlRequest:
             None Behavior: Validation Error (Mandatory).
     """
     target: Optional[ProjectionSettings] = None
+    action: Optional[str] = None  # NEW: "NORMALIZE", "RESET_DEFOCUS"
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "ProjectionControlRequest")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.target = p.model(ProjectionSettings, self.target, "target", default=ProjectionSettings(_mode=p.mode))
+        self.action = p.str(self.action, "action")
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
-        v.check_nested(self.target)
-        v.check_has_intent(self.target, "empty_target", "Projection request has no parameters set")
 
-        # Specific Logic: If switching to DIFFRACTION, you must provide a camera length
-        if self.target.optical_mode == "DIFFRACTION":
-            v.check(self.target.camera_length is not None, "missing_cam_len",
-                    "Switching to Diffraction requires a camera_length")
+        has_intent = (self.target is not None) or (self.action is not None)
+        has_intent = has_intent or _has_actionable_extras(self.extra)
+        v.check(has_intent, "empty", "Request must have settings (target) or an action")
 
+        if self.target:
+            v.check_nested(self.target)
+            if self.target.optical_mode == "DIFFRACTION":
+                v.check(self.target.camera_length is not None, "missing_cam_len",
+                        "Switching to Diffraction requires a camera_length")
         return v.valid
 
     def to_dict(self) -> dict:
@@ -3800,8 +4062,7 @@ class ScanControlRequest:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
-        # Renamed from ScanRequest to ScanControlRequest
-        p = FieldParser(self, self._mode, "ScanControlRequest")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.action = p.str(self.action, "action")
         self.target = p.model(ScanSettings, self.target, "target", default=ScanSettings(_mode=p.mode))
 
@@ -3842,21 +4103,25 @@ class VacuumControlRequest:
             None Behavior: Defaulted to False.
     """
     target: Optional[VacuumSettings] = None
-    force: Optional[bool] = None  # If True, bypasses some software soft-checks (use with caution)
+    action: Optional[str] = None  # NEW: "VENT", "CYCLE", "BAKE"
+    force: Optional[bool] = None
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "VacuumControlRequest")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.target = p.model(VacuumSettings, self.target, "target", default=VacuumSettings(_mode=p.mode))
+        self.action = p.str(self.action, "action")
         self.force = p.bool(self.force, "force", default=False)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
-        v.check_nested(self.target)
 
-        v.check_has_intent(self.target, "empty_target",
-                           "Request must specify at least one state change")
+        has_intent = (self.target is not None) or (self.action is not None)
+        v.check(has_intent, "empty", "Request must have settings (target) or an action")
+
+        if self.target:
+            v.check_nested(self.target)
         return v.valid
 
     def to_dict(self) -> dict:
@@ -3884,43 +4149,37 @@ class ApertureControlRequest:
             None Behavior: Defaulted to False.
     """
     aperture_id: Optional[str] = None
-    target: Optional[Aperture] = None
+    target: Optional[ApertureSettings] = None
+    action: Optional[str] = None  # NEW: "RESET", "CALIBRATE"
     relative: Optional[bool] = None
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "ApertureControlRequest")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.aperture_id = p.id(self.aperture_id, "aperture_id")
         self.relative = p.bool(self.relative, "relative", default=False)
-        self.target = p.model(Aperture, self.target, "target", default=Aperture(_mode=p.mode))
+        self.target = p.model(ApertureSettings, self.target, "target", default=ApertureSettings(_mode=p.mode))
+        self.action = p.str(self.action, "action")
+
         if self.aperture_id is None and self.target.aperture_id is not None:
             self.aperture_id = self.target.aperture_id
-        elif self.target.aperture_id is None and self.aperture_id is not None:
-            self.target.aperture_id = self.aperture_id
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
         v.check(bool(self.aperture_id), "aperture_id", "aperture_id is required")
-        v.check_nested(self.target)
 
-        # ID Mismatch
-        if self.target.aperture_id and self.aperture_id and self.target.aperture_id != self.aperture_id:
-            v.check(False, "id_mismatch",
-                    f"Ambiguous IDs: '{self.aperture_id}' vs '{self.target.aperture_id}'",
-                    heal=lambda: setattr(self.target, 'aperture_id', self.aperture_id))
+        has_intent = (self.target is not None) or (self.action is not None)
+        has_intent = has_intent or _has_actionable_extras(self.extra)
+        v.check(has_intent, "empty", "Request must have settings (target) or an action")
 
-        # Relative logic check
+        if self.target:
+            v.check_nested(self.target)
+            if self.target.aperture_id and self.aperture_id != self.target.aperture_id:
+                v.check(False, "id_mismatch", "Ambiguous IDs")
+
         if self.relative:
-            v.check(self.target.position is not None, "relative_no_pos", "Relative mode requires a position vector")
-
-        # No-Op Check
-        has_intent = (
-                self.target.inserted is not None or self.target.size_index is not None or self.target.position is not None)
-        # Vendor-only intents may live exclusively in Extras.vendor / Extras.unknown
-        has_intent = has_intent or _has_actionable_extras(getattr(self.target, 'extra', None))
-        has_intent = has_intent or _has_actionable_extras(getattr(self, 'extra', None))
-        v.check(has_intent, "empty_payload", "Request contains no changes")
+            v.check(self.target.position is not None, "relative_no_pos", "Relative move requires position")
 
         return v.valid
 
@@ -3957,11 +4216,10 @@ class AcquisitionRequest:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "AcquisitionRequest")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.detector_id = p.id(self.detector_id, "detector_id")
         self.detector = p.model(DetectorSettings, self.detector, "detector", default=DetectorSettings(_mode=p.mode))
         self.image = p.model(ImageOutputSettings, self.image, "image", default=ImageOutputSettings(_mode=p.mode))
-        # Sync Logic
         if self.detector_id is None and self.detector.detector_id is not None:
             self.detector_id = self.detector.detector_id
         elif self.detector.detector_id is None and self.detector_id is not None:

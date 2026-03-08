@@ -418,7 +418,7 @@ Interaction is divided into "Nouns" (Data/State) and "Verbs" (Intents/Requests).
    -----------------------------------------------------------------------------
    Vacuum                | VacuumSettings         | VacuumControlRequest
    -----------------------------------------------------------------------------
-   Aperture              | Aperture               | ApertureControlRequest
+   Aperture              | ApertureSettings       | ApertureControlRequest
    -----------------------------------------------------------------------------
 
 ===============================================================================
@@ -438,6 +438,7 @@ and Telemetry (Dynamic/Snapshot).
    │   ├── projection_system: ProjectionSystemSettings (Mag ranges, Cam lengths)
    │   ├── scan_system: ScanSystemSettings (Dwell time limits, Scan modes)
    │   ├── detector_system: DetectorSystemSettings (Registry of cameras)
+   │   ├── aperture_system: ApertureSystemSettings (Registry of apertures)
    │   └── info: SystemInfo (Static hardware IDs, IP addresses)
    ├── image: ImageOutputSettings (File formats, Save paths)
    └── protocol: Dict (User-defined automation scripts)
@@ -451,7 +452,7 @@ and Telemetry (Dynamic/Snapshot).
    ├── projection: ProjectionSettings (Defocus, magnification, optical mode)
    ├── scan: ScanSettings (Active dwell time, grid resolution)
    ├── vacuum: VacuumSettings (Valve states, pressures)
-   ├── apertures: Dict[str, Aperture] (State of all inserted apertures)
+   ├── apertures: Dict[str, ApertureSettings] (State of all inserted apertures)
    └── detectors: Dict[str, DetectorSettings] (State of all active cameras)
 
 ===============================================================================
@@ -537,6 +538,7 @@ class Units:
     NM = "nm"
     UM = "um"
     MM = "mm"
+    V = "V"
     KV = "kV"
     NA = "nA"
     UA = "uA"
@@ -567,81 +569,61 @@ T = TypeVar("T")
 # =============================================================================
 
 @dataclass
-class Extras:
+class ParserExtras:
     """
-    Structured container for non-standard data.
-
-    This class supports the 'Lenient Parsing' philosophy. Any data that doesn't
-    fit the strict schema ends up here for later inspection instead of causing a crash.
-
-    Attributes:
-    vendor: Namespaced storage for vendor-specific extensions (Identity/State).
-            Example: {"JEOL": {"alpha_selector": 3}}
-    options: Execution modifiers and flags (Behavior/Action).
-             Example: {"tolerance_nm": 5.0, "retries": 3, "timeout": 60}
-    unknown: Storage for JSON keys not recognized by the schema.
-    raw: Original raw values that failed type coercion/validation.
-    notes: Error messages or warnings generated during parsing.
+    Data-Plane Extras (Recursion-Safe).
+    Contains ONLY the overflow buckets required for robust, LENIENT parsing.
+    Used by proprietary Vendor structures to avoid infinite recursion loops.
     """
-    vendor: Dict[str, Dict[str, Any]] = field(default_factory=dict)
-    options: Dict[str, Any] = field(default_factory=dict)
     unknown: Dict[str, Any] = field(default_factory=dict)
     raw: Dict[str, Any] = field(default_factory=dict)
     notes: Dict[str, Any] = field(default_factory=dict)
 
     def is_empty(self) -> bool:
-        return not (self.vendor or self.options or self.unknown or self.raw or self.notes)
+        return not (self.unknown or self.raw or self.notes)
 
     def to_dict(self) -> Dict[str, Any]:
         """Return a JSON-safe payload representation."""
 
-        # We define EXACTLY what to keep
         def _keep(val: Any) -> bool:
-            # 1. Always toss None
             if val is None: return False
-
-            # 2. Toss empty collections (dict, list, string)
-            if isinstance(val, (dict, list, tuple, str)) and len(val) == 0:
-                return False
-
-            # 3. Keep everything else! (Numbers, Booleans, Objects)
+            if isinstance(val, (dict, list, tuple, str)) and len(val) == 0: return False
             return True
 
-        # Now 0 and False will survive because they are not None and not collections
         return _jsonable({k: deepcopy(v) for k, v in self.__dict__.items() if _keep(v)})
 
-    @staticmethod
-    def from_any(value: Any, *, owner: str = "unknown") -> "Extras":
-        """Intelligently parse 'extra' fields from various inputs."""
-        if isinstance(value, Extras): return value
-        ex = Extras()
+    @classmethod
+    def from_any(cls, value: Any, *, owner: str = "unknown") -> "ParserExtras":
+        """Intelligently and dynamically parse fields using introspection."""
+        if isinstance(value, cls): return value
+        ex = cls()
 
         if not isinstance(value, dict):
             if value is not None:
                 ex.raw[f"{owner}.extra"] = repr(value)
             return ex
 
-        # Smart merge logic
-        known = {"vendor", "options", "unknown", "raw", "notes"}
+        # Dynamic Introspection: The class reads its own shape
+        known = {f.name for f in dataclasses.fields(cls)}
         keys = set(value.keys())
 
         if keys and keys.issubset(known):
-            # It is a structured Extras dict
+            # It's a structured dict matching the class perfectly
             for k in known:
                 if k in value and isinstance(value[k], dict):
                     setattr(ex, k, deepcopy(value[k]))
 
-            # Handle vendor special case (vendor keys might not be dicts)
-            if "vendor" in value and isinstance(value["vendor"], dict):
+            # Special handling for vendor if this is the Control-Plane Extras subclass
+            if "vendor" in known and "vendor" in value and isinstance(value["vendor"], dict):
                 for vend, payload in value["vendor"].items():
-                    ex.vendor[str(vend)] = deepcopy(payload) if isinstance(payload, dict) else {
+                    getattr(ex, "vendor")[str(vend)] = deepcopy(payload) if isinstance(payload, dict) else {
                         "_value": deepcopy(payload)}
         else:
-            # It is a flat dict (unknown data) -> Check partial matches
+            # It's a flat/dirty dict -> Check partial matches
             for k in known:
                 if k in value: setattr(ex, k, deepcopy(value[k]))
 
-            # Remaining goes to unknown
+            # Remaining goes to unknown (which both classes have)
             for k, v in value.items():
                 if k not in known:
                     try:
@@ -649,6 +631,20 @@ class Extras:
                     except:
                         ex.raw[f"{owner}.extra.{k}"] = repr(v)
         return ex
+
+
+@dataclass
+class Extras(ParserExtras):
+    """
+    Control-Plane Extras (The Trojan Horse).
+    Inherits data-plane buckets and adds routing compartments.
+    Used exclusively by Universal/Canonical structures.
+    """
+    vendor: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    options: Dict[str, Any] = field(default_factory=dict)
+
+    def is_empty(self) -> bool:
+        return super().is_empty() and not (self.vendor or self.options)
 
 def _has_actionable_extras(extra: "Extras") -> bool:
     """Return True if `extra` carries explicit user intent.
@@ -820,16 +816,17 @@ def _finish_to_dict(payload: Dict[str, Any], extra: Any) -> Dict[str, Any]:
     add_extra_if_any(payload, extra)
     return _jsonable(drop_none_keys(payload))
 
-def normalize_extra(extra: Any) -> Extras:
-    if extra is None: return Extras()
-    if isinstance(extra, Extras): return extra
-    if isinstance(extra, dict): return Extras.from_any(extra)
-    raise TypeError(f"extra must be Extras, dict, or None, got {type(extra)}")
+def normalize_extra(extra: Any, target_type: Type = Extras) -> Any:
+    """Polymorphic normalizer that respects the target extra type."""
+    if extra is None: return target_type()
+    if isinstance(extra, ParserExtras): return extra
+    if isinstance(extra, dict): return target_type.from_any(extra)
+    raise TypeError(f"extra must be ParserExtras/Extras, dict, or None, got {type(extra)}")
 
-def normalize_extra_lenient(extra: Any, owner: str) -> Extras:
-    try: return normalize_extra(extra)
+def normalize_extra_lenient(extra: Any, owner: str, target_type: Type = Extras) -> Any:
+    try: return normalize_extra(extra, target_type)
     except Exception:
-        ex = Extras()
+        ex = target_type()
         ex.raw[f"{owner}.extra"] = repr(extra)
         return ex
 
@@ -872,14 +869,19 @@ class FieldParser:
         self.strict = is_strict(self.mode)
         self.owner = owner_name
 
-        # Initialize Extras immediately
+        # Detect which Extra class this specific Noun uses
+        ext_type = Extras
+        if is_dataclass(obj):
+            for f in dataclasses.fields(obj):
+                if f.name == "extra" and f.type == ParserExtras:
+                    ext_type = ParserExtras
+
         raw_extra = getattr(obj, "extra", None)
         if self.strict:
-            self.extra = normalize_extra(raw_extra)
+            self.extra = normalize_extra(raw_extra, ext_type)
         else:
-            self.extra = normalize_extra_lenient(raw_extra, owner_name)
+            self.extra = normalize_extra_lenient(raw_extra, owner_name, ext_type)
 
-        # Attach the normalized container back to the object
         obj.extra = self.extra
 
     def _key(self, name: str) -> str:
@@ -1729,8 +1731,8 @@ class StageSystemSettings:
         "max_step_distance": Units.NM,
         "max_step_deg": Units.DEG,
         "eucentric_z": Units.NM,
-        "settle_time": Units.S,
-        "timeout": Units.S
+        "settle_time": Units.SEC,
+        "timeout": Units.SEC
     }
 
     def __post_init__(self):
@@ -1755,8 +1757,8 @@ class StageSystemSettings:
         self.max_step_distance = p.qty(self.max_step_distance, "max_step_distance", Units.NM)
         self.max_step_deg = p.qty(self.max_step_deg, "max_step_deg", Units.DEG)
         self.eucentric_z = p.qty(self.eucentric_z, "eucentric_z", Units.NM)
-        self.settle_time = p.qty(self.settle_time, "settle_time", Units.S)
-        self.timeout = p.qty(self.timeout, "timeout", Units.S)
+        self.settle_time = p.qty(self.settle_time, "settle_time", Units.SEC)
+        self.timeout = p.qty(self.timeout, "timeout", Units.SEC)
 
         self.active_holder_id = p.id(self.active_holder_id, "active_holder_id")
         self.available_holders = p.map_model(HolderCapabilities, self.available_holders, "available_holders",

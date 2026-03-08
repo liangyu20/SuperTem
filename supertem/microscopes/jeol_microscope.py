@@ -51,7 +51,7 @@ III. Hardware Quirks & Workarounds
     retry loop that waits for *stable* idle status.
 
   - **Detector Sync:** If the active detector is offline, `set_scan_active` will
-    fallback to the internal scan generator to prevent beam damage (static beam).
+    fall back to the internal scan generator to prevent beam damage (static beam).
 
   - **Lazy Loading:** `PyJEM` is imported only upon instantiation. This allows
     the class to be imported in simulation/offline environments without crashing.
@@ -129,13 +129,13 @@ do not map to standard physics (e.g. Alpha Selector, OLc DAC).
 """
 import time
 import logging
-from typing import Dict, List, Optional, Tuple, Any, Callable, Union
+from typing import Dict, List, Optional, Tuple, Any, Callable
 import numpy as np
 from datetime import datetime, timezone
 
 # Import Abstract Base and Strict Structures
-from supertem.microscope import TemMicroscope
-from supertem.structures.base import (
+from supertem.microscopes.base_microscope import TemMicroscope
+from supertem.structures.base_structures import (
     MicroscopeSettings,
     SystemInfo,
     StagePosition,
@@ -143,9 +143,6 @@ from supertem.structures.base import (
     ProjectionSettings,
     DetectorSettings,
     DetectorSystemSettings,
-    ScanSettings,
-    VacuumSettings,
-    ApertureSettings,
     MicroscopeImage,
     MicroscopeImageMetadata,
     AcquisitionRequest,
@@ -154,7 +151,15 @@ from supertem.structures.base import (
     Quantity,
     Extras,
     Point,
-    ROI, DetectorCapabilities
+    ROI, DetectorCapabilities,
+    ParseMode
+)
+
+# Import Vendor Structures (Add this near the top)
+from supertem.structures.jeol_structures import (
+    JeolBeamExtras,
+    JeolProjectionExtras,
+    JeolDetectorExtras
 )
 
 # Import Vendor Adapters
@@ -170,10 +175,21 @@ class JeolMicroscope(TemMicroscope):
     """
 
     _APERTURE_MAP = {
-        "CLA": 1, "OLA": 2, "HCA": 3, "SAA": 4, "ENTA": 5,
-        "CL1": 0, "CL2": 1, "OL": 2, "HC": 3, "SA": 4,
-        "ENT": 5, "HX": 6, "BF": 7,
-        "AUX": 8, "AUX1": 8, "AUX2": 9, "AUX3": 10, "AUX4": 11
+        # --- Standard JEOL Indices (ARM/Exp) ---
+        "CLA": 0, "CL1": 0,    # Condenser 1
+        "CL2": 1,              # Condenser 2
+        "OLA": 2, "OL": 2,     # Objective
+        "HCA": 3, "HC": 3,     # High Contrast
+        "SAA": 4, "SA": 4,     # Selected Area
+        "ENTA": 5, "ENT": 5,   # Entry
+        "HX": 6,  "EDS": 6,    # Hard X-Ray / EDS
+        "BF": 7,               # Bright Field?
+
+        # --- Auxiliaries (Only used if in Config) ---
+        "AUX1": 8,
+        "AUX2": 9,
+        "AUX3": 10,
+        "AUX4": 11
     }
 
     # TEM Function Indices
@@ -242,6 +258,8 @@ class JeolMicroscope(TemMicroscope):
         # Load Tables: Start with Defaults, then Override with Config
         self.optical_tables = DEFAULT_TABLES.copy()
 
+        self._init_vacuum_map()
+
         if config:
             # Check for attribute first (Pydantic/Dataclass)
             val = getattr(config, 'defocus_scale', None)
@@ -266,6 +284,46 @@ class JeolMicroscope(TemMicroscope):
                             else:
                                 self.optical_tables[mode_key] = tables
                         logger.info(f"Loaded custom JEOL optical tables for: {list(custom.keys())}")
+
+    # =========================================================================
+    # VENDOR PAYLOAD MUTATION HOOKS (The Safety Firewall)
+    # =========================================================================
+
+    def _validate_vendor_beam(self, target: BeamSettings) -> None:
+        """Intercepts raw JEOL beam dicts, validates hardware limits, and strongly types them."""
+        if not target or not target.extra or not target.extra.vendor:
+            return
+
+        raw_payload = target.extra.vendor.get("JEOL")
+        if isinstance(raw_payload, dict):
+            # 1. Instantiate strictly typed vendor noun
+            typed_extras = JeolBeamExtras.from_dict(raw_payload, mode=target._mode)
+            # 2. Perform Dual-Duty logic + hardware safety checks
+            typed_extras.validate(mode=target._mode)
+            # 3. Mutate the universal payload IN PLACE
+            target.extra.vendor["JEOL"] = typed_extras
+
+    def _validate_vendor_projection(self, target: ProjectionSettings) -> None:
+        """Intercepts raw JEOL projection dicts, validates limits, and strongly types them."""
+        if not target or not target.extra or not target.extra.vendor:
+            return
+
+        raw_payload = target.extra.vendor.get("JEOL")
+        if isinstance(raw_payload, dict):
+            typed_extras = JeolProjectionExtras.from_dict(raw_payload, mode=target._mode)
+            typed_extras.validate(mode=target._mode)
+            target.extra.vendor["JEOL"] = typed_extras
+
+    def _validate_vendor_detector(self, target: DetectorSettings) -> None:
+        """Intercepts raw JEOL detector dicts, validates limits, and strongly types them."""
+        if not target or not target.extra or not target.extra.vendor:
+            return
+
+        raw_payload = target.extra.vendor.get("JEOL")
+        if isinstance(raw_payload, dict):
+            typed_extras = JeolDetectorExtras.from_dict(raw_payload, mode=target._mode)
+            typed_extras.validate(mode=target._mode)
+            target.extra.vendor["JEOL"] = typed_extras
 
     # ---------------------------------------------------------------------
     # Internal helpers
@@ -428,6 +486,32 @@ class JeolMicroscope(TemMicroscope):
                 self._primary_detector_id = detector_id
         return d
 
+    def _is_stem_detector(self, detector_id: str) -> bool:
+        """Determine if the detector is a STEM detector."""
+        u_id = detector_id.upper()
+        if any(x in u_id for x in ["DFI", "BFI", "BEI", "SEI", "EXT"]):
+            return True
+        if any(x in u_id for x in ["CAM", "US", "RIO", "ONEVIEW", "TVCAM"]):
+            return False
+
+        sys_det = self.system_settings.detector_system
+        if sys_det and sys_det.capabilities_by_id:
+            caps = sys_det.capabilities_by_id.get(detector_id)
+            if caps and caps.extra and caps.extra.vendor and "JEOL" in caps.extra.vendor:
+                val = caps.extra.vendor["JEOL"].get("is_stem_detector")
+                if val is not None: return bool(val)
+
+        return (self.get_mode() == "STEM")
+
+    def _get_scan_controller_detector(self):
+        det_id = self.get_primary_detector_id()
+        if det_id and self._is_stem_detector(det_id):
+            return self._get_detector(det_id)
+        for d_id in self.list_detectors():
+            if self._is_stem_detector(d_id):
+                return self._get_detector(d_id)
+        return None
+
     def _coerce_xy(self, xy: Any) -> Optional[Tuple[float, float]]:
         """
         Safely convert PyJEM return values (often list [x, y]) into a float tuple.
@@ -464,21 +548,6 @@ class JeolMicroscope(TemMicroscope):
 
         logger.warning(f"Stage move timed out after {timeout}s (GetStatus never settled).")
 
-    def _get_scan_controller_detector(self):
-        """Helper to find the Detector instance that controls scanning (STEM)."""
-        if self.det_mod is None:
-            return None
-        try:
-            det_id = self.get_primary_detector_id()
-            if det_id is None:
-                ids = self.list_detectors()
-                det_id = ids[0] if ids else None
-            if det_id is None:
-                return None
-            return self._get_detector(det_id)
-        except Exception:
-            return None
-
     def _set_imaging_area(self, *, width=None, height=None, x=None, y=None) -> None:
         """Set scanning sub-region (Imaging Area)."""
         d = self._get_scan_controller_detector()
@@ -486,19 +555,76 @@ class JeolMicroscope(TemMicroscope):
             logger.error("[SCAN] SetImagingArea failed: No scan controller detector found.")
             raise RuntimeError("Scan detector hardware not connected.")
 
+        # Update local config
         w = int(width if width is not None else self._scan_cfg.get("width_px", 512))
         h = int(height if height is not None else self._scan_cfg.get("height_px", 512))
         xx = int(x if x is not None else self._scan_cfg.get("x_px", 0))
         yy = int(y if y is not None else self._scan_cfg.get("y_px", 0))
 
-        if hasattr(d, "set_imaging_area"):
-            logger.debug(f"[SCAN] SetImagingArea({w}x{h} @ {xx},{yy})")
-            try:
-                d.set_imaging_area(w, h, xx, yy)
-                self._scan_cfg.update({"width_px": w, "height_px": h, "x_px": xx, "y_px": yy})
-            except Exception as e:
-                logger.error(f"[SCAN] SetImagingArea failed: {e}")
-                raise
+        # Determine strict ROI object
+        target_roi = ROI(x=xx, y=yy, width=w, height=h)
+
+        # Reuse the robust logic from set_detector_roi to handle AreaMode vs Standard Mode
+        # We need to find the detector ID to call the public setter
+        d_id = None
+        for k, v in self._active_detectors.items():
+            if v == d:
+                d_id = k
+                break
+
+        if d_id:
+            logger.debug(f"[SCAN] SetImagingArea delegating to set_detector_roi for {d_id}")
+            self.set_detector_roi(d_id, target_roi)
+
+            # Update internal cache if successful
+            self._scan_cfg.update({"width_px": w, "height_px": h, "x_px": xx, "y_px": yy})
+        else:
+            # Fallback if ID lookup fails (unlikely)
+            payload = {"ImagingArea": {"x": xx, "y": yy, "width": w, "height": h}}
+            self._write_hw(d, "set_detectorsetting", "SCAN", payload)
+
+    def _init_vacuum_map(self):
+        """
+        Initialize the vacuum gauge map.
+        Priority:
+        1. User Configuration (system_settings.extras['vacuum_map'])
+        2. Default F200 Map (Fallback)
+        """
+        # Default Fallback (JEOL F200 Standard)
+        default_map = {
+            "COLUMN_PIG": 0,  # PIG1: Column Rough/Backing
+            "DETECTOR_PIG": 2,  # PIG3: Camera/Detector Chamber
+            "SPECIMEN_PIG": 3,  # PIG4: Specimen Chamber (Airlock)
+            "BUFFER_PIG": 4,  # PIG5: Buffer/Reservoir Tank
+            "COLUMN_PEG": 0  # PEG1: Column High Vacuum
+        }
+
+        # Try to load overrides from system_settings
+        # Structure expects: settings.extras = {"vendor": {"JEOL": {"vacuum_map": {...}}}}
+        try:
+            if self.system_settings.extra and \
+                    "vacuum_map" in self.system_settings.extra.vendor.get("JEOL", {}):
+                custom_map = self.system_settings.extra.vendor["JEOL"]["vacuum_map"]
+                # Update defaults with custom values
+                default_map.update(custom_map)
+                logger.info(f"Loaded custom vacuum map: {default_map}")
+        except Exception as e:
+            logger.warning(f"Failed to load custom vacuum map, using defaults: {e}")
+
+        self.vacuum_map = default_map
+
+    def _get_gauge_value(self, gauge_type: str, map_key: str, unit: str) -> Optional[Quantity]:
+        idx = self.vacuum_map.get(map_key, 0)
+        method = "GetPegInfo" if gauge_type == "PEG" else "GetPigInfo"
+
+        def _extract(val_list):
+            # [cite_start]PyJEM returns [value, status] [cite: 2254, 2263]
+            if isinstance(val_list, (list, tuple)) and len(val_list) >= 1:
+                return Q_(float(val_list[0]), unit)
+            return None
+
+        # Pass the gauge index as *args
+        return self._read_hw(self.vac, method, "VAC", _extract, None, idx)
 
     @staticmethod
     def _first_int(d: dict, keys: Tuple[str, ...]) -> Optional[int]:
@@ -531,7 +657,8 @@ class JeolMicroscope(TemMicroscope):
 
     def _read_hw(self, hardware: Any, method_name: str, tag: str,
                  converter: Optional[Callable[[Any], Any]] = None,
-                 default: Any = None) -> Any:
+                 default: Any = None,
+                 *args) -> Any:  # <--- Added *args support
         """
         Atomic Getter (Null means Unknown).
         Checks hardware existence -> Try/Catch -> Log -> Convert.
@@ -542,7 +669,8 @@ class JeolMicroscope(TemMicroscope):
 
         try:
             func = getattr(hardware, method_name)
-            val = func() if callable(func) else func
+            # Pass *args to the function call
+            val = func(*args) if callable(func) else func
             if converter and val is not None:
                 return converter(val)
             return val
@@ -666,7 +794,7 @@ class JeolMicroscope(TemMicroscope):
 
     def connect(self, host: str, port: Optional[int] = None, **kwargs) -> None:
         """
-        Connect to the JEOL TEM3 interface and initialize sub-modules.
+        Connect to the JEOL TEM3 interface and initialize submodules.
         """
         if not self.tem3_mod:
             logger.error("[CONN] Cannot connect: PyJEM library not found.")
@@ -828,7 +956,7 @@ class JeolMicroscope(TemMicroscope):
         Get speed settings for Motor(0) or Piezo(1).
         GetSpeedMode returns [xy, z, tiltxy] (0=slow, 1=normal, 2=fast)
         """
-        raw = self._read_hw(self.stage, "GetSpeedMode", "STAGE", args=(drive_mode,))
+        raw = self._read_hw(self.stage, "GetSpeedMode", "STAGE", None, None, drive_mode)
 
         speed_map = {0: "slow", 1: "normal", 2: "fast"}
         if raw and len(raw) >= 3:
@@ -1189,22 +1317,89 @@ class JeolMicroscope(TemMicroscope):
 
     def get_brightness_value(self) -> Optional[int]:
         """Vendor: Get CL3 Lens Value (0-65535). Controls Brightness."""
-        return self._read_hw(self.lens, "GetCL3", "BEAM", self._to_int)
+        return self.get_condenser_lens_3()
 
     def get_mds_mode(self) -> str:
         """
         Vendor: Get Minimum Dose System (MDS) status.
-        Returns: 'OFF', 'SEARCH', 'FOCUS', 'PHOTO', or 'UNKNOWN'.
+        Returns: 'OFF', 'SEARCH', 'FOCUS', 'PHOTOSET', or 'UNKNOWN'.
         """
-        if self._read_hw(self.mds, "GetSearchMode", "BEAM") == 1:
-            return "SEARCH"
-        if self._read_hw(self.mds, "GetFocusMode", "BEAM") == 1:
-            return "FOCUS"
-        if self._read_hw(self.mds, "GetPhotoMode", "BEAM") == 1:
-            return "PHOTO"
-        if self.mds:
+        mode = self._read_hw(self.mds, "GetSearchMode", "BEAM")
+        if mode == 0:
             return "OFF"
+        elif mode == 1:
+            return "SEARCH"
+        elif mode == 2:
+            return "FOCUS"
+        elif mode == 3:
+            return "PHOTOSET"
+        else:
+            return "UNKNOWN"
+
+    def get_condenser_lens_1(self) -> Optional[int]:
+        """Atomic: Get CL1 (Spot Size Lens)."""
+        return self._read_hw(self.lens, "GetCL1", "BEAM", self._to_int)
+
+    def get_condenser_lens_2(self) -> Optional[int]:
+        """Atomic: Get CL2 (Convergence Lens)."""
+        return self._read_hw(self.lens, "GetCL2", "BEAM", self._to_int)
+
+    def get_condenser_lens_3(self) -> Optional[int]:
+        """Atomic: Get CL3 (Convergence Lens)."""
+        return self._read_hw(self.lens, "GetCL3", "BEAM", self._to_int)
+
+    def get_gun_type_index(self) -> Optional[int]:
+        """
+        Get the Gun Type Index.
+        1=W, 2=LaB6, 3=FEG, 11=TFEG(ARM200F), 12=CFEG(ARM200F), etc.
+        """
+        return self._read_hw(self.gun, "GetGunTypeEx", "BEAM", self._to_int)
+
+    def get_feg_emission_state(self) -> str:
+        """
+        Get FEG Emission Status. Returns: 'ON', 'OFF', or 'UNKNOWN'.
+        """
+        # [cite_start]Returns [phase, status]. status: 0=Off, 1=On [cite: 1041]
+        res = self._read_hw(self.feg, "GetEmissionOnStatus", "BEAM")
+        if res and isinstance(res, (list, tuple)) and len(res) >= 2:
+            return "ON" if res[1] == 1 else "OFF"
         return "UNKNOWN"
+
+    def get_gun_anode_1_voltage(self) -> Optional[Quantity]:
+        """Get Anode 1 Voltage[cite: 1193]."""
+        return self._read_hw(self.gun, "GetAnode1CurrentValue", "BEAM", lambda v: Q_(float(v), Units.KV))
+
+    def get_gun_anode_2_voltage(self) -> Optional[Quantity]:
+        """Get Anode 2 Voltage[cite: 1202]."""
+        return self._read_hw(self.gun, "GetAnode2CurrentValue", "BEAM", lambda v: Q_(float(v), Units.KV))
+
+    def get_gun_bias_current(self) -> Optional[Quantity]:
+        """Get Bias Current[cite: 1220]."""
+        return self._read_hw(self.gun, "GetBiasCurrentValue", "BEAM", self._to_ua)
+
+    def get_gun_filament_current(self) -> Optional[Quantity]:
+        """Get Filament Current[cite: 1238]."""
+        return self._read_hw(self.gun, "GetFilamentCurrentValue", "BEAM", lambda v: Q_(float(v), "A"))
+
+    def get_spot_alignment(self) -> Tuple[Optional[float], Optional[float]]:
+        """Get Spot Alignment (SpotA). Distinct from Beam Shift."""
+        return self._read_hw(self.def_, "GetSpotA", "BEAM", self._coerce_xy, default=(None, None))
+
+    def get_condenser_alignment_1(self) -> Tuple[Optional[float], Optional[float]]:
+        """Get CL Alignment 1 (CLA1)."""
+        return self._read_hw(self.def_, "GetCLA1", "BEAM", self._coerce_xy, default=(None, None))
+
+    def get_condenser_alignment_2(self) -> Tuple[Optional[float], Optional[float]]:
+        """Get CL Alignment 2 (CLA2)."""
+        return self._read_hw(self.def_, "GetCLA2", "BEAM", self._coerce_xy, default=(None, None))
+
+    def get_gun_alignment_1(self) -> Tuple[Optional[float], Optional[float]]:
+        """Get Gun Alignment 1 (GunA1)."""
+        return self._read_hw(self.def_, "GetGunA1", "BEAM", self._coerce_xy, default=(None, None))
+
+    def get_gun_alignment_2(self) -> Tuple[Optional[float], Optional[float]]:
+        """Get Gun Alignment 2 (GunA2)."""
+        return self._read_hw(self.def_, "GetGunA2", "BEAM", self._coerce_xy, default=(None, None))
 
     # --- Atomic Setters ---
 
@@ -1273,12 +1468,12 @@ class JeolMicroscope(TemMicroscope):
 
     def set_brightness_value(self, val: int, **kwargs) -> None:
         """Vendor: Set CL3 Lens (Brightness) Value (0-65535)."""
-        self._write_hw(self.lens, "SetCL3", "BEAM", int(val))
+        self.set_condenser_lens_3(val)
 
     def set_mds_mode(self, mode: str) -> None:
         """
         Vendor: Set MDS Mode.
-        mode: 'OFF', 'SEARCH', 'FOCUS', 'PHOTO'
+        mode: 'OFF', 'SEARCH', 'FOCUS', 'PHOTOSET'
         """
         m = mode.strip().upper()
 
@@ -1291,12 +1486,24 @@ class JeolMicroscope(TemMicroscope):
         elif m == "FOCUS":
             # MDS3.SetFocusMode(1)
             self._write_hw(self.mds, "SetFocusMode", "BEAM", 1)
-        elif m == "PHOTO":
-            # MDS3.SetPhotoMode(1)
-            self._write_hw(self.mds, "SetPhotoMode", "BEAM", 1)
+        elif m == "PHOTOSET":
+            # MDS3.SetPhotosetMode(1)
+            self._write_hw(self.mds, "SetPhotosetMode", "BEAM", 1)
         else:
             logger.error(f"[BEAM] Set MDS failed: Unknown mode {mode}")
             raise ValueError(f"Unknown MDS mode: {mode}")
+
+    def set_condenser_lens_1(self, dac: int) -> None:
+        """Atomic: Set CL1."""
+        self._write_hw(self.lens, "SetCL1", "BEAM", int(dac))
+
+    def set_condenser_lens_2(self, dac: int) -> None:
+        """Atomic: Set CL2."""
+        self._write_hw(self.lens, "SetCL2", "BEAM", int(dac))
+
+    def set_condenser_lens_3(self, dac: int) -> None:
+        """Atomic: Set CL3."""
+        self._write_hw(self.lens, "SetCL3", "BEAM", int(dac))
 
     def set_ht_wobbler(self, active: bool) -> None:
         """Vendor: Control HT Wobbler (Voltage Center)."""
@@ -1308,70 +1515,163 @@ class JeolMicroscope(TemMicroscope):
         state = 1 if active else 0
         self._write_hw(self.gun, "SetA2Wobbler", "BEAM", state)
 
-    # --- Helper Layer Overrides (Logic & Validation) ---
+    def set_feg_emission_state(self, active: bool) -> None:
+        """Turn FEG Emission ON or OFF. (FEG3 Only)"""
+        # 1. Hardware Module Check
+        if not self.feg:
+            logger.error("[BEAM] SetEmission failed: FEG3 module missing.")
+            raise RuntimeError("FEG hardware not connected.")
+
+        # 2. Gun Type Safety Check
+        # 1=W, 2=LaB6, 3=FEG, 11=TFEG, 12=CFEG
+        gun_type = self.get_gun_type_index()
+        if gun_type not in (3, 11, 12):
+             logger.error(f"[BEAM] Aborting FEG command. Detected GunType={gun_type} (Not a FEG).")
+             raise RuntimeError(f"Cannot control FEG Emission: Instrument is not a FEG (Type {gun_type}).")
+
+        # 3. Execution
+        if active:
+            logger.info("[BEAM] Executing FEG Emission ON...")
+            self._write_hw(self.feg, "ExecEmissionOn", "BEAM", 1)
+        else:
+            logger.info("[BEAM] Executing FEG Emission OFF...")
+            self._write_hw(self.feg, "SetFEGEmissionOff", "BEAM", 0)
+
+    def set_feg_flashing_execution(self, active: bool) -> None:
+        """
+        Atomic: Execute FEG Auto-Flashing.
+        Source: PyJEM.TEM3.FEG3.ExecAutoFlashing
+        """
+        if not self.feg:
+            logger.error("[BEAM] Flash failed: FEG hardware not connected.")
+            raise RuntimeError("FEG hardware not connected.")
+
+        if not hasattr(self.feg, "ExecAutoFlashing"):
+            raise RuntimeError("FEG Flashing not supported (FEG3 module missing or incompatible).")
+
+        # Gun Type Safety Check
+        gun_type = self.get_gun_type_index()
+        if gun_type not in (3, 11, 12):
+             logger.error(f"[BEAM] Aborting FEG Flash. Detected GunType={gun_type} (Not a FEG).")
+             raise RuntimeError(f"Cannot execute FEG Flashing: Instrument is not a FEG (Type {gun_type}).")
+
+        val = 1 if active else 0
+        tag = "Start" if active else "Stop"
+        logger.info(f"[BEAM] Executing FEG Auto-Flash ({tag})...")
+
+        self._write_hw(self.feg, "ExecAutoFlashing", "BEAM", val)
+
+    def set_spot_alignment(self, x: int, y: int) -> None:
+        """Set Spot Alignment (SpotA)."""
+        self._write_hw(self.def_, "SetSpotA", "BEAM", int(x), int(y))
+
+    def set_condenser_alignment_1(self, x: int, y: int) -> None:
+        """Set CL Alignment 1 (CLA1)."""
+        self._write_hw(self.def_, "SetCLA1", "BEAM", int(x), int(y))
+
+    def set_condenser_alignment_2(self, x: int, y: int) -> None:
+        """Set CL Alignment 2 (CLA2)."""
+        self._write_hw(self.def_, "SetCLA2", "BEAM", int(x), int(y))
+
+    def set_gun_alignment_1(self, x: int, y: int) -> None:
+        """Set Gun Alignment 1 (GunA1)."""
+        self._write_hw(self.def_, "SetGunA1", "BEAM", int(x), int(y))
+
+    def set_gun_alignment_2(self, x: int, y: int) -> None:
+        """Set Gun Alignment 2 (GunA2)."""
+        self._write_hw(self.def_, "SetGunA2", "BEAM", int(x), int(y))
+
+    # --- Helper Layer Overrides ---
 
     def get_beam_settings(self) -> BeamSettings:
         """
         Aggregates beam state.
-        Override: Adds 'alpha_index' and 'brightness_value' (CL3) to extras.
+        Override: Instantiates a strictly typed JeolBeamExtras object.
         """
         # 1. Get Base Settings (Calls standard atomics)
         bs = super().get_beam_settings()
 
-        # 2. Get Vendor Extras
-        alpha = self.get_alpha_index()
-        cl3 = self.get_brightness_value()
+        # 2. Instantiate Typed Vendor Extras in LENIENT mode (Read = Survive)
+        jeol_extras = JeolBeamExtras(_mode=ParseMode.LENIENT)
 
-        vendor_extras = {}
-        if alpha is not None:
-            vendor_extras["alpha_index"] = alpha
-        if cl3 is not None:
-            vendor_extras["brightness_value"] = cl3
+        # Optics
+        jeol_extras.alpha_index = self.get_alpha_index()
+        jeol_extras.brightness_value = self.get_brightness_value()
+        jeol_extras.condenser_lens_1 = self.get_condenser_lens_1()
+        jeol_extras.condenser_lens_2 = self.get_condenser_lens_2()
+        jeol_extras.condenser_lens_3 = self.get_condenser_lens_3()
 
-        # 3. Merge into extras
-        if vendor_extras:
-            current_extras = bs.extra.vendor if (bs.extra and bs.extra.vendor) else {}
-            current_extras.setdefault("JEOL", {}).update(vendor_extras)
+        # Alignments (Only set if valid tuple returned)
+        if (v := self.get_spot_alignment()) != (None, None): jeol_extras.spot_alignment = v
+        if (v := self.get_condenser_alignment_1()) != (None, None): jeol_extras.condenser_alignment_1 = v
+        if (v := self.get_condenser_alignment_2()) != (None, None): jeol_extras.condenser_alignment_2 = v
+        if (v := self.get_gun_alignment_1()) != (None, None): jeol_extras.gun_alignment_1 = v
+        if (v := self.get_gun_alignment_2()) != (None, None): jeol_extras.gun_alignment_2 = v
 
-            if not bs.extra:
-                bs.extra = Extras(vendor=current_extras)
-            else:
-                bs.extra.vendor = current_extras
+        # Source Diagnostics
+        jeol_extras.gun_type_index = self.get_gun_type_index()
+        feg_state = self.get_feg_emission_state()
+        if feg_state != "UNKNOWN":
+            jeol_extras.feg_emission_state = feg_state
+
+        jeol_extras.gun_anode_1 = self.get_gun_anode_1_voltage()
+        jeol_extras.gun_anode_2 = self.get_gun_anode_2_voltage()
+        jeol_extras.gun_bias = self.get_gun_bias_current()
+        jeol_extras.gun_filament = self.get_gun_filament_current()
+
+        # 3. Attach to canonical object
+        if not bs.extra:
+            bs.extra = Extras()
+        bs.extra.vendor["JEOL"] = jeol_extras
 
         return bs
 
     def apply_beam_settings(self, settings: BeamSettings, **kwargs) -> None:
         """
-        Override: Handles standard settings + Vendor Extras (Alpha, Brightness).
+        Override: Handles standard settings + Vendor Extras (Alpha, Brightness, Alignment, FEG).
+        Safely unpacks the strongly-typed JeolBeamExtras object.
         """
         # 1. Apply Standard Settings (Voltage, Spot, etc)
         super().apply_beam_settings(settings, **kwargs)
 
-        # 2. Handle JEOL Extras
-        vend = getattr(settings.extra, 'vendor', None)
-        jeol_v = vend.get('JEOL') if isinstance(vend, dict) else None
+        # 2. Handle JEOL Extras (Now a strongly-typed object)
+        vend = getattr(settings.extra, 'vendor', {})
+        jeol_v = vend.get('JEOL')
 
-        if isinstance(jeol_v, dict):
+        if isinstance(jeol_v, JeolBeamExtras):
             # A. Alpha Index (Convergence)
-            if 'alpha_index' in jeol_v:
-                try:
-                    idx = int(jeol_v['alpha_index'])
-                    # Validation: Hardware usually 0-8
-                    if not (0 <= idx <= 8):
-                        raise ValueError(f"Alpha index {idx} out of range (0-8).")
-                    self.set_alpha_index(idx)
-                except Exception as e:
-                    logger.error(f"[BEAM] Failed to set alpha_index: {e}")
-                    raise
+            if jeol_v.alpha_index is not None:
+                self.set_alpha_index(jeol_v.alpha_index)
 
-            # B. Brightness (CL3)
-            if 'brightness_value' in jeol_v:
-                try:
-                    val = int(jeol_v['brightness_value'])
-                    self.set_brightness_value(val)
-                except Exception as e:
-                    logger.error(f"[BEAM] Failed to set brightness_value: {e}")
-                    raise
+            # B. Brightness & Lens DACs
+            if jeol_v.brightness_value is not None:
+                self.set_brightness_value(jeol_v.brightness_value)
+            if jeol_v.condenser_lens_1 is not None:
+                self.set_condenser_lens_1(jeol_v.condenser_lens_1)
+            if jeol_v.condenser_lens_2 is not None:
+                self.set_condenser_lens_2(jeol_v.condenser_lens_2)
+            if jeol_v.condenser_lens_3 is not None:
+                self.set_condenser_lens_3(jeol_v.condenser_lens_3)
+
+            # C. FEG Control
+            if jeol_v.feg_emission_state is not None:
+                state = jeol_v.feg_emission_state.upper()
+                if state in ["ON", "TRUE"]:
+                    self.set_feg_emission_state(True)
+                elif state in ["OFF", "FALSE"]:
+                    self.set_feg_emission_state(False)
+
+            # D. Fine Alignments
+            if jeol_v.spot_alignment is not None:
+                self.set_spot_alignment(jeol_v.spot_alignment[0], jeol_v.spot_alignment[1])
+            if jeol_v.condenser_alignment_1 is not None:
+                self.set_condenser_alignment_1(jeol_v.condenser_alignment_1[0], jeol_v.condenser_alignment_1[1])
+            if jeol_v.condenser_alignment_2 is not None:
+                self.set_condenser_alignment_2(jeol_v.condenser_alignment_2[0], jeol_v.condenser_alignment_2[1])
+            if jeol_v.gun_alignment_1 is not None:
+                self.set_gun_alignment_1(jeol_v.gun_alignment_1[0], jeol_v.gun_alignment_1[1])
+            if jeol_v.gun_alignment_2 is not None:
+                self.set_gun_alignment_2(jeol_v.gun_alignment_2[0], jeol_v.gun_alignment_2[1])
 
     def perform_beam_action(self, action: str, **kwargs) -> None:
         """
@@ -1380,12 +1680,13 @@ class JeolMicroscope(TemMicroscope):
         act = action.upper().strip()
 
         if act == "FLASH_FEG":
-            # PyJEM FEG3: ExecAutoFlashing(1) -> Start
-            if hasattr(self.feg, "ExecAutoFlashing"):
-                logger.info("[BEAM] Executing FEG Auto-Flash...")
-                self._write_hw(self.feg, "ExecAutoFlashing", "BEAM", 1)
-            else:
-                raise RuntimeError("FEG Flashing not supported (FEG3 module missing or incompatible).")
+            self.set_feg_flashing_execution(True)
+
+        elif act == "EMISSION_ON":
+            self.set_feg_emission_state(True)
+
+        elif act == "EMISSION_OFF":
+            self.set_feg_emission_state(False)
 
         elif act in ["OPEN_VALVE", "OPEN_V1"]:
             logger.info("[BEAM] Opening Gun Valve (V1)...")
@@ -1409,6 +1710,29 @@ class JeolMicroscope(TemMicroscope):
             active = bool(kwargs.get("active", True))
             logger.info(f"[BEAM] A2 (Gun) Wobbler active={active}")
             self.set_a2_wobbler(active)
+
+        elif act == "WOBBLE_TILT":
+            amp_x = int(kwargs.get("amp_x", 200))
+            amp_y = int(kwargs.get("amp_y", 0))
+            cycles = int(kwargs.get("cycles", 5))
+            delay = float(kwargs.get("delay", 0.15))
+
+            cx_raw, cy_raw = self.get_beam_tilt()
+            if cx_raw is None or cy_raw is None:
+                raise RuntimeError("Cannot wobble: Current Beam Tilt unknown.")
+
+            cx, cy = float(cx_raw), float(cy_raw)
+            logger.info(f"[BEAM] Starting Tilt Wobbler (Center: {cx:.0f},{cy:.0f})")
+
+            try:
+                for _ in range(cycles):
+                    self.set_beam_tilt(cx + amp_x, cy + amp_y)
+                    time.sleep(delay)
+                    self.set_beam_tilt(cx - amp_x, cy - amp_y)
+                    time.sleep(delay)
+            finally:
+                self.set_beam_tilt(cx, cy)
+                logger.debug("[BEAM] Tilt Wobbler finished.")
 
         else:
             super().perform_beam_action(action, **kwargs)
@@ -1476,7 +1800,7 @@ class JeolMicroscope(TemMicroscope):
 
         # TEM:LOWMAG -> OM (Objective Mini)
         if mode_key == "TEM:LOWMAG":
-            raw_dac = self.get_objective_mini_lens()
+            raw_dac = self.get_objective_mini_lens_1()
             if raw_dac is None: return None
 
             # F200 Thresholds
@@ -1531,13 +1855,49 @@ class JeolMicroscope(TemMicroscope):
         """Atomic: Get OLS (Objective Lens SuperFine)."""
         return self._read_hw(self.lens, "GetOLSuperFineValue", "LENS", self._to_int)
 
-    def get_objective_mini_lens(self) -> Optional[int]:
+    def get_objective_mini_lens_1(self) -> Optional[int]:
         """Atomic: Get OM (Objective Mini-lens)."""
         return self._read_hw(self.lens, "GetOM", "LENS", self._to_int)
+
+    def get_objective_mini_lens_2(self) -> Optional[int]:
+        """Atomic: Get OM2."""
+        return self._read_hw(self.lens, "GetOM2", "LENS", self._to_int)
+
+    def get_focus_lens_coarse(self) -> Optional[int]:
+        """Atomic: Get FLc (Focus Lens Coarse)."""
+        return self._read_hw(self.lens, "GetFLc", "LENS", self._to_int)
+
+    def get_focus_lens_fine(self) -> Optional[int]:
+        """Atomic: Get FLf (Focus Lens Fine)."""
+        return self._read_hw(self.lens, "GetFLf", "LENS", self._to_int)
 
     def get_intermediate_lens_1(self) -> Optional[int]:
         """Atomic: Get IL1 (Intermediate Lens 1)."""
         return self._read_hw(self.lens, "GetIL1", "LENS", self._to_int)
+
+    def get_intermediate_lens_2(self) -> Optional[int]:
+        """Atomic: Get IL2."""
+        return self._read_hw(self.lens, "GetIL2", "LENS", self._to_int)
+
+    def get_intermediate_lens_3(self) -> Optional[int]:
+        """Atomic: Get IL3."""
+        return self._read_hw(self.lens, "GetIL3", "LENS", self._to_int)
+
+    def get_intermediate_lens_4(self) -> Optional[int]:
+        """Atomic: Get IL4."""
+        return self._read_hw(self.lens, "GetIL4", "LENS", self._to_int)
+
+    def get_projector_lens_1(self) -> Optional[int]:
+        """Atomic: Get PL1."""
+        return self._read_hw(self.lens, "GetPL1", "LENS", self._to_int)
+
+    def get_projector_lens_2(self) -> Optional[int]:
+        """Atomic: Get PL2."""
+        return self._read_hw(self.lens, "GetPL2", "LENS", self._to_int)
+
+    def get_projector_lens_3(self) -> Optional[int]:
+        """Atomic: Get PL3."""
+        return self._read_hw(self.lens, "GetPL3", "LENS", self._to_int)
 
     def get_image_shift_2(self) -> Tuple[Optional[float], Optional[float]]:
         """Ref: Def3.GetIS2 """
@@ -1693,7 +2053,7 @@ class JeolMicroscope(TemMicroscope):
             else:
                 std = 0xC85A
             target_dac = int(std + (target_nm / 1500.0))
-            self.set_objective_mini_lens(target_dac)
+            self.set_objective_mini_lens_1(target_dac)
 
         elif mode_key == "TEM:MAG":
             std = 0x8010 if mag < 1500000 else 0x7D10
@@ -1735,13 +2095,49 @@ class JeolMicroscope(TemMicroscope):
         self._write_hw(self.lens, "SetOLSuperFineSw", "LENS", 1)
         self._write_hw(self.lens, "SetOLSuperFineValue", "LENS", int(dac))
 
-    def set_objective_mini_lens(self, dac: int) -> None:
+    def set_objective_mini_lens_1(self, dac: int) -> None:
         """Atomic: Set OM."""
         self._write_hw(self.lens, "SetOM", "LENS", int(dac))
+
+    def set_objective_mini_lens_2(self, dac: int) -> None:
+        """Atomic: Set OM2."""
+        self._write_hw(self.lens, "SetOM2", "LENS", int(dac))
+
+    def set_focus_lens_coarse(self, dac: int) -> None:
+        """Atomic: Set FLc."""
+        self._write_hw(self.lens, "SetFLc", "LENS", int(dac))
+
+    def set_focus_lens_fine(self, dac: int) -> None:
+        """Atomic: Set FLf."""
+        self._write_hw(self.lens, "SetFLf", "LENS", int(dac))
 
     def set_intermediate_lens_1(self, dac: int) -> None:
         """Atomic: Set IL1."""
         self._write_hw(self.lens, "SetIL1", "LENS", int(dac))
+
+    def set_intermediate_lens_2(self, dac: int) -> None:
+        """Atomic: Set IL2."""
+        self._write_hw(self.lens, "SetIL2", "LENS", int(dac))
+
+    def set_intermediate_lens_3(self, dac: int) -> None:
+        """Atomic: Set IL3."""
+        self._write_hw(self.lens, "SetIL3", "LENS", int(dac))
+
+    def set_intermediate_lens_4(self, dac: int) -> None:
+        """Atomic: Set IL4."""
+        self._write_hw(self.lens, "SetIL4", "LENS", int(dac))
+
+    def set_projector_lens_1(self, dac: int) -> None:
+        """Atomic: Set PL1."""
+        self._write_hw(self.lens, "SetPL1", "LENS", int(dac))
+
+    def set_projector_lens_2(self, dac: int) -> None:
+        """Atomic: Set PL2."""
+        self._write_hw(self.lens, "SetPL2", "LENS", int(dac))
+
+    def set_projector_lens_3(self, dac: int) -> None:
+        """Atomic: Set PL3."""
+        self._write_hw(self.lens, "SetPL3", "LENS", int(dac))
 
     def set_standard_focus(self) -> None:
         """Atomic: Execute Standard Focus."""
@@ -1780,22 +2176,38 @@ class JeolMicroscope(TemMicroscope):
     def get_projection_settings(self) -> ProjectionSettings:
         """
         Aggregates optical state.
-        Ensures raw DACs are ALWAYS stored in extras by calling atomic getters.
+        Override: Instantiates a strictly typed JeolProjectionExtras object.
         """
         # 1. Get Standard Physics
         ps = super().get_projection_settings()
 
-        # 2. Raw Hardware Registers (Source of Truth)
-        extras = ps.extra.vendor.setdefault("JEOL", {})
-        extras["objective_lens_coarse"] = self.get_objective_lens_coarse()
-        extras["objective_lens_fine"] = self.get_objective_lens_fine()
-        extras["objective_lens_superfine"] = self.get_objective_lens_superfine()
-        extras["objective_mini_lens"] = self.get_objective_mini_lens()
-        extras["intermediate_lens_1"] = self.get_intermediate_lens_1()
+        # 2. Instantiate Typed Vendor Extras in LENIENT mode
+        jeol_extras = JeolProjectionExtras(_mode=ParseMode.LENIENT)
 
-        # 3. Logical Properties
-        extras["diffraction_focus_index"] = self.get_diffraction_focus()
-        extras["image_shift_2"] = self.get_image_shift_2()
+        jeol_extras.objective_lens_coarse = self.get_objective_lens_coarse()
+        jeol_extras.objective_lens_fine = self.get_objective_lens_fine()
+        jeol_extras.objective_lens_superfine = self.get_objective_lens_superfine()
+        jeol_extras.objective_mini_lens_1 = self.get_objective_mini_lens_1()
+        jeol_extras.objective_mini_lens_2 = self.get_objective_mini_lens_2()
+        jeol_extras.focus_lens_coarse = self.get_focus_lens_coarse()
+        jeol_extras.focus_lens_fine = self.get_focus_lens_fine()
+        jeol_extras.intermediate_lens_1 = self.get_intermediate_lens_1()
+        jeol_extras.intermediate_lens_2 = self.get_intermediate_lens_2()
+        jeol_extras.intermediate_lens_3 = self.get_intermediate_lens_3()
+        jeol_extras.intermediate_lens_4 = self.get_intermediate_lens_4()
+        jeol_extras.projector_lens_1 = self.get_projector_lens_1()
+        jeol_extras.projector_lens_2 = self.get_projector_lens_2()
+        jeol_extras.projector_lens_3 = self.get_projector_lens_3()
+
+        jeol_extras.diffraction_focus_index = self.get_diffraction_focus()
+
+        if (v := self.get_image_shift_2()) != (None, None):
+            jeol_extras.image_shift_2 = v
+
+        # 3. Attach to canonical object
+        if not ps.extra:
+            ps.extra = Extras()
+        ps.extra.vendor["JEOL"] = jeol_extras
 
         return ps
 
@@ -1809,27 +2221,45 @@ class JeolMicroscope(TemMicroscope):
         # 1. Apply Standard Physics (Safe to call super)
         super().apply_projection_settings(settings, **kwargs)
 
-        # 2. Apply Register Overrides (Manual DAC Control)
+        # 2. Apply Register Overrides (Now a strongly-typed object)
         vend = getattr(settings.extra, "vendor", {})
-        jeol_v = vend.get("JEOL") if isinstance(vend, dict) else None
+        jeol_v = vend.get("JEOL")
 
-        if isinstance(jeol_v, dict):
-            if "objective_lens_coarse" in jeol_v:
-                self.set_objective_lens_coarse(jeol_v["objective_lens_coarse"])
-            if "objective_lens_fine" in jeol_v:
-                self.set_objective_lens_fine(jeol_v["objective_lens_fine"])
-            if "objective_lens_superfine" in jeol_v:
-                self.set_objective_lens_superfine(jeol_v["objective_lens_superfine"])
-            if "objective_mini_lens" in jeol_v:
-                self.set_objective_mini_lens(jeol_v["objective_mini_lens"])
-            if "intermediate_lens_1" in jeol_v:
-                self.set_intermediate_lens_1(jeol_v["intermediate_lens_1"])
-            if "image_shift_2" in jeol_v:
-                val = jeol_v["image_shift_2"]
-                if isinstance(val, (list, tuple)) and len(val) >= 2:
-                    self.set_image_shift_2(val[0], val[1])
-            if "diffraction_focus_index" in jeol_v:
-                self.set_diffraction_focus(jeol_v["diffraction_focus_index"])
+        if isinstance(jeol_v, JeolProjectionExtras):
+            if jeol_v.objective_lens_coarse is not None:
+                self.set_objective_lens_coarse(jeol_v.objective_lens_coarse)
+            if jeol_v.objective_lens_fine is not None:
+                self.set_objective_lens_fine(jeol_v.objective_lens_fine)
+            if jeol_v.objective_lens_superfine is not None:
+                self.set_objective_lens_superfine(jeol_v.objective_lens_superfine)
+            if jeol_v.objective_mini_lens_1 is not None:
+                self.set_objective_mini_lens_1(jeol_v.objective_mini_lens_1)
+            if jeol_v.objective_mini_lens_2 is not None:
+                self.set_objective_mini_lens_2(jeol_v.objective_mini_lens_2)
+            if jeol_v.focus_lens_coarse is not None:
+                self.set_focus_lens_coarse(jeol_v.focus_lens_coarse)
+            if jeol_v.focus_lens_fine is not None:
+                self.set_focus_lens_fine(jeol_v.focus_lens_fine)
+            if jeol_v.intermediate_lens_1 is not None:
+                self.set_intermediate_lens_1(jeol_v.intermediate_lens_1)
+            if jeol_v.intermediate_lens_2 is not None:
+                self.set_intermediate_lens_2(jeol_v.intermediate_lens_2)
+            if jeol_v.intermediate_lens_3 is not None:
+                self.set_intermediate_lens_3(jeol_v.intermediate_lens_3)
+            if jeol_v.intermediate_lens_4 is not None:
+                self.set_intermediate_lens_4(jeol_v.intermediate_lens_4)
+            if jeol_v.projector_lens_1 is not None:
+                self.set_projector_lens_1(jeol_v.projector_lens_1)
+            if jeol_v.projector_lens_2 is not None:
+                self.set_projector_lens_2(jeol_v.projector_lens_2)
+            if jeol_v.projector_lens_3 is not None:
+                self.set_projector_lens_3(jeol_v.projector_lens_3)
+
+            if jeol_v.diffraction_focus_index is not None:
+                self.set_diffraction_focus(jeol_v.diffraction_focus_index)
+
+            if jeol_v.image_shift_2 is not None:
+                self.set_image_shift_2(jeol_v.image_shift_2[0], jeol_v.image_shift_2[1])
 
     def perform_projection_action(self, action: str, **kwargs) -> None:
         act = action.upper().strip()
@@ -1893,100 +2323,99 @@ class JeolMicroscope(TemMicroscope):
 
     def get_detector_inserted(self, detector_id: str) -> bool:
         """Check if detector is mechanically inserted."""
-        if self.det_mod is None:
-            logger.debug("[DET] GetInserted failed: Hardware not connected.")
-            return True
-        try:
-            d = self._get_detector(detector_id)
-            if hasattr(d, "get_insert_state"):
-                st = d.get_insert_state()
-                if isinstance(st, dict):
-                    for k in ("InsertState", "state", "Status"):
-                        if k in st:
-                            v = st[k]
-                            if isinstance(v, str):
-                                return v.strip().upper() in ("IN", "INSERT", "ON")
-                            return bool(v)
-        except Exception as e:
-            logger.debug(f"[DET] GetInserted({detector_id}) failed: {e}")
-        return True
+        d = self._get_detector(detector_id)
+
+        def _parse_insert(st):
+            if isinstance(st, dict):
+                # PyJEM responses vary by detector type
+                for k in ("InsertState", "state", "Status"):
+                    if k in st:
+                        v = st[k]
+                        if isinstance(v, str):
+                            return v.strip().upper() in ("IN", "INSERT", "ON")
+                        return bool(v)
+            return True  # Default to inserted if we can't determine (safest)
+
+        # Use _read_hw to handle logging/errors
+        return self._read_hw(d, "get_insert_state", "DET", converter=_parse_insert, default=True)
 
     def get_detector_exposure(self, detector_id: str) -> Optional[Quantity]:
-        """Get detector exposure time."""
-        if self.det_mod is None:
-            logger.debug("[DET] GetExposure failed: Hardware not connected.")
-            return None
-        try:
-            d = self._get_detector(detector_id)
-            res, _ = jeol_adapter.from_jeol_detector_response(d.get_detectorsetting(), detector_id)
-            return res.exposure
-        except Exception as e:
-            logger.debug(f"[DET] GetExposure({detector_id}) failed: {e}")
+        """
+        Get detector physical exposure time (Integration Time).
+        Returns None for STEM detectors (Strict Separation).
+        """
+        if self._is_stem_detector(detector_id):
             return None
 
+        d = self._get_detector(detector_id)
+
+        # Helper lambda to use with _read_hw for consistent logging
+        def _fetch(hw):
+            raw = hw.get_detectorsetting()
+            settings, _ = jeol_adapter.from_jeol_detector_response(raw, detector_id)
+            return settings.exposure
+
+        return self._read_hw(d, "get_detectorsetting", "DET", converter=lambda x: _fetch(d))
+
     def get_detector_binning_index(self, detector_id: str) -> Optional[int]:
-        """Get binning index."""
-        if self.det_mod is None:
-            logger.debug("[DET] GetBinning failed: Hardware not connected.")
-            return None
-        try:
-            d = self._get_detector(detector_id)
-            res, _ = jeol_adapter.from_jeol_detector_response(d.get_detectorsetting(), detector_id)
-            return res.binning_index
-        except Exception as e:
-            logger.debug(f"[DET] GetBinning({detector_id}) failed: {e}")
-            return None
+        d = self._get_detector(detector_id)
+
+        def _fetch(hw):
+            raw = hw.get_detectorsetting()
+            settings, _ = jeol_adapter.from_jeol_detector_response(raw, detector_id)
+            return settings.binning_index
+
+        return self._read_hw(d, "get_detectorsetting", "DET", converter=lambda x: _fetch(d))
 
     def get_detector_binning_xy(self, detector_id: str) -> Optional[Tuple[int, int]]:
         b = self.get_detector_binning_index(detector_id)
         return (b, b) if b is not None else None
 
     def get_detector_roi(self, detector_id: str) -> Optional[ROI]:
-        """Get Region of Interest."""
-        if self.det_mod is None:
-            logger.debug("[DET] GetROI failed: Hardware not connected.")
-            return None
-        try:
-            d = self._get_detector(detector_id)
-            res, _ = jeol_adapter.from_jeol_detector_response(d.get_detectorsetting(), detector_id)
-            return res.roi
-        except Exception as e:
-            logger.debug(f"[DET] GetROI({detector_id}) failed: {e}")
-            return None
+        """Get Region of Interest (Aware of Scan Mode for STEM)."""
+        d = self._get_detector(detector_id)
+
+        def _fetch(hw):
+            raw = hw.get_detectorsetting()
+            settings, _ = jeol_adapter.from_jeol_detector_response(raw, detector_id)
+            return settings.roi
+
+        return self._read_hw(d, "get_detectorsetting", "DET", converter=lambda x: _fetch(d))
 
     def get_detector_gain_index(self, detector_id: str) -> Optional[int]:
         d = self._get_detector(detector_id)
-        if not hasattr(d, "get_detectorsetting"): return None
-        try:
-            st = d.get_detectorsetting()
-            return int(st.get("GainIndex")) if "GainIndex" in st else None
-        except Exception:
-            return None
+        return self._read_hw(d, "get_detectorsetting", "DET",
+                             converter=lambda st: self._first_int(st, ("GainIndex",)))
 
     def get_detector_offset_index(self, detector_id: str) -> Optional[int]:
         d = self._get_detector(detector_id)
-        try:
-            st = d.get_detectorsetting() if hasattr(d, "get_detectorsetting") else {}
-            return int(st.get("OffsetIndex")) if "OffsetIndex" in st else None
-        except Exception:
-            return None
+        return self._read_hw(d, "get_detectorsetting", "DET",
+                             converter=lambda st: self._first_int(st, ("OffsetIndex",)))
 
     def get_detector_digital_rotation(self, detector_id: str) -> Optional[Quantity]:
-        # See scan rotation, usually shared or part of setting
-        return None
+        """
+        Get Digital Rotation (Software Image Flip).
+        Returns None for STEM detectors (Strict Separation).
+        """
+        d = self._get_detector(detector_id)
+
+        def _fetch(hw):
+            raw = hw.get_detectorsetting()
+            # Adapter now strictly looks ONLY for "DigitalRotation"
+            settings, _ = jeol_adapter.from_jeol_detector_response(raw, detector_id)
+            return settings.digital_rotation
+
+        return self._read_hw(d, "get_detectorsetting", "DET", converter=lambda x: _fetch(d))
 
     def get_detector_frame_integration(self, detector_id: str) -> Optional[int]:
-        """Get frame integration count."""
-        if self.det_mod is None:
-            logger.debug("[DET] GetIntegration failed: Hardware not connected.")
-            return None
-        try:
-            d = self._get_detector(detector_id)
-            res, _ = jeol_adapter.from_jeol_detector_response(d.get_detectorsetting(), detector_id)
-            return res.frame_integration
-        except Exception as e:
-            logger.debug(f"[DET] GetIntegration({detector_id}) failed: {e}")
-            return None
+        d = self._get_detector(detector_id)
+
+        def _fetch(hw):
+            raw = hw.get_detectorsetting()
+            settings, _ = jeol_adapter.from_jeol_detector_response(raw, detector_id)
+            return settings.frame_integration
+
+        return self._read_hw(d, "get_detectorsetting", "DET", converter=lambda x: _fetch(d))
 
     def get_detector_frame_rate(self, detector_id: str) -> Optional[Quantity]:
         # Typically not exposed directly by PyJEM unless calculated
@@ -2008,54 +2437,42 @@ class JeolMicroscope(TemMicroscope):
 
     def set_detector_insertion(self, detector_id: str, inserted: bool, **kwargs) -> None:
         """Insert or retract detector."""
-        if self.det_mod is None:
-            logger.error("[DET] SetInsertion failed: Detector hardware not connected.")
-            raise RuntimeError("Detector hardware not connected.")
+        d = self._get_detector(detector_id)
 
-        try:
-            d = self._get_detector(detector_id)
-            logger.debug(f"[DET] SetInsertion({detector_id}, {inserted})")
-            if inserted and hasattr(d, "insert"):
-                d.insert()
-            elif (not inserted) and hasattr(d, "retract"):
-                d.retract()
-        except Exception as e:
-            logger.error(f"[DET] SetInsertion failed: {e}")
-            raise
+        # _write_hw handles the "Hardware disconnected" check and logging
+        if inserted:
+            if hasattr(d, "insert"):
+                self._write_hw(d, "insert", "DET")
+            else:
+                # Fallback/No-op log if method missing (unlikely for valid detector)
+                logger.warning(f"[DET] Detector {detector_id} does not support 'insert'.")
+        else:
+            if hasattr(d, "retract"):
+                self._write_hw(d, "retract", "DET")
+            else:
+                logger.warning(f"[DET] Detector {detector_id} does not support 'retract'.")
 
     def set_detector_exposure(self, detector_id: str, exposure: Quantity, **kwargs) -> None:
-        """Set detector exposure time."""
-        if self.det_mod is None:
-            logger.error("[DET] SetExposure failed: Detector hardware not connected.")
-            raise RuntimeError("Detector hardware not connected.")
+        """Set detector physical exposure time (Cameras Only)."""
+        if self._is_stem_detector(detector_id):
+            msg = (f"Detector '{detector_id}' is a STEM detector. "
+                   f"Use 'set_scan_pixel_dwell' to control timing.")
+            logger.error(f"[DET] {msg}")
+            raise ValueError(msg)
 
-        try:
-            d = self._get_detector(detector_id)
-            us = int(exposure.to(Units.US).magnitude)
-            logger.debug(f"[DET] SetExposure({detector_id}, {us}us)")
+        val_ms = float(exposure.to(Units.MS).magnitude)
+        d = self._get_detector(detector_id)
 
-            if hasattr(d, "set_exposuretime_value"):
-                d.set_exposuretime_value(us)
-            elif hasattr(d, "set_exposuretime_index"):
-                d.set_exposuretime_index(us)
-        except Exception as e:
-            logger.error(f"[DET] SetExposure failed: {e}")
-            raise
+        if hasattr(d, "set_exposuretime_value"):
+            self._write_hw(d, "set_exposuretime_value", "DET", val_ms)
+        elif hasattr(d, "set_exposuretime_index"):
+            self._write_hw(d, "set_exposuretime_index", "DET", val_ms)
+        else:
+            self._write_hw(d, "set_detectorsetting", "DET", {"ExposureTimeValue": val_ms})
 
     def set_detector_binning_index(self, detector_id: str, index: int, **kwargs) -> None:
-        """Set detector binning."""
-        if self.det_mod is None:
-            logger.error("[DET] SetBinning failed: Detector hardware not connected.")
-            raise RuntimeError("Detector hardware not connected.")
-
-        try:
-            d = self._get_detector(detector_id)
-            logger.debug(f"[DET] SetBinning({detector_id}, {index})")
-            if hasattr(d, "set_binningindex"):
-                d.set_binningindex(int(index))
-        except Exception as e:
-            logger.error(f"[DET] SetBinning failed: {e}")
-            raise
+        d = self._get_detector(detector_id)
+        self._write_hw(d, "set_binningindex", "DET", int(index))
 
     def set_detector_binning_xy(self, detector_id: str, binning: Tuple[int, int], **kwargs) -> None:
         if binning[0] != binning[1]:
@@ -2063,20 +2480,38 @@ class JeolMicroscope(TemMicroscope):
         self.set_detector_binning_index(detector_id, binning[0])
 
     def set_detector_roi(self, detector_id: str, roi: Optional[ROI], **kwargs) -> None:
-        """Set detector ROI."""
-        if self.det_mod is None:
-            logger.error("[DET] SetROI failed: Detector hardware not connected.")
-            raise RuntimeError("Detector hardware not connected.")
+        """
+        Set detector ROI.
+        Handles key mapping:
+        - STEM + Area Mode -> 'AreaModeImagingArea' (Sub-scan)
+        - STEM + Scan Mode -> 'ImagingArea' (Resolution)
+        - TEM -> 'ImagingArea' (Binning/Crop)
+        """
+        if roi is None: return
 
-        try:
-            d = self._get_detector(detector_id)
-            if roi:
-                logger.debug(f"[DET] SetROI({detector_id}, {roi})")
-                if hasattr(d, "set_areamode_imagingarea"):
-                    d.set_areamode_imagingarea(int(roi.width), int(roi.height), int(roi.x), int(roi.y))
-        except Exception as e:
-            logger.error(f"[DET] SetROI failed: {e}")
-            raise
+        d = self._get_detector(detector_id)
+        is_stem = self._is_stem_detector(detector_id)
+
+        # 1. Determine correct setter/key
+        use_area_mode = False
+        if is_stem:
+            mode = self.get_scan_mode()  # Returns "Scan", "Spot", "Area"
+            if mode == "Area":
+                use_area_mode = True
+
+        # 2. Execute
+        if use_area_mode:
+            # STEM Area Mode: Sets sub-scan region
+            logger.debug(f"[DET] Setting AreaMode ROI for {detector_id} (STEM AREA): {roi}")
+            # Note: set_areamode_imagingarea(width, height, x, y)
+            self._write_hw(d, "set_areamode_imagingarea", "DET",
+                           int(roi.width), int(roi.height), int(roi.x), int(roi.y))
+        else:
+            # Standard Mode: Sets Resolution (STEM) or Crop (TEM)
+            # Typically using ImagingArea dict
+            logger.debug(f"[DET] Setting Standard ROI for {detector_id}: {roi}")
+            payload = {"ImagingArea": jeol_adapter._struct_to_jeol_roi(roi)}
+            self._write_hw(d, "set_detectorsetting", "DET", payload)
 
     def set_detector_gain_index(self, detector_id: str, index: int, **kwargs) -> None:
         # Atomic simulation via bulk update
@@ -2086,28 +2521,37 @@ class JeolMicroscope(TemMicroscope):
         self._atomic_detector_update(detector_id, {"OffsetIndex": int(index)})
 
     def set_detector_digital_rotation(self, detector_id: str, angle: Quantity, **kwargs) -> None:
-        # Check set_scanrotation
+        """
+        Set Digital Rotation (Software Image Flip).
+        Strictly for TEM Cameras. STEM users must use set_scan_rotation().
+        """
         deg = float(angle.to(Units.DEG).magnitude)
         d = self._get_detector(detector_id)
-        if hasattr(d, "set_scanrotation"):
-            d.set_scanrotation(deg)
-        else:
-            raise NotImplementedError("Digital rotation not supported on this detector.")
+        is_stem = self._is_stem_detector(detector_id)
+
+        if is_stem:
+            # STRICT SEPARATION:
+            # We no longer automatically rotate coils here.
+            # We assume STEM detectors don't do digital flips unless proven otherwise.
+            msg = (f"Detector '{detector_id}' is a STEM detector. "
+                   f"Use 'set_scan_rotation' to rotate the scan coils. "
+                   f"'digital_rotation' is reserved for camera image flipping.")
+            logger.error(f"[DET] {msg}")
+            raise ValueError(msg)
+
+        # Standard TEM Camera Logic
+        self._write_hw(d, "set_detectorsetting", "DET", {"DigitalRotation": deg})
 
     def set_detector_frame_integration(self, detector_id: str, count: int, **kwargs) -> None:
         """Set frame integration count."""
-        if self.det_mod is None:
-            logger.error("[DET] SetIntegration failed: Detector hardware not connected.")
-            raise RuntimeError("Detector hardware not connected.")
+        d = self._get_detector(detector_id)
 
-        try:
-            d = self._get_detector(detector_id)
-            logger.debug(f"[DET] SetIntegration({detector_id}, {count})")
-            if hasattr(d, "set_frameintegration"):
-                d.set_frameintegration(int(count))
-        except Exception as e:
-            logger.error(f"[DET] SetIntegration failed: {e}")
-            raise
+        if hasattr(d, "set_frameintegration"):
+            self._write_hw(d, "set_frameintegration", "DET", int(count))
+        else:
+            # Some cameras might use the dict interface, but set_frameintegration is standard for cameras
+            # Fallback to dict update if needed, or raise
+            self._write_hw(d, "set_detectorsetting", "DET", {"frameIntegration": int(count)})
 
     def set_detector_frame_rate(self, detector_id: str, rate: Quantity, **kwargs) -> None:
         raise NotImplementedError("Setting frame rate explicitly not supported.")
@@ -2261,18 +2705,58 @@ class JeolMicroscope(TemMicroscope):
             created_at=datetime.now(timezone.utc).isoformat(),
             image_size_px=(arr.shape[1], arr.shape[0]),
             extra=Extras(vendor={"JEOL": jeol_vendor}),
-            _mode="lenient"
+            _mode=ParseMode.LENIENT
         )
 
         return MicroscopeImage(data=arr, metadata=metadata)
+
+    def execute_detector_auto_contrast(self, detector_id: str) -> None:
+        """Atomic: Execute Auto Contrast/Brightness (STEM)."""
+        d = self._get_detector(detector_id)
+        self._write_hw(d, "AutoContrastBrightness", "DET")
+
+    def execute_detector_auto_focus(self, detector_id: str) -> None:
+        """Atomic: Execute Auto Focus (STEM)."""
+        d = self._get_detector(detector_id)
+        self._write_hw(d, "AutoFocus", "DET")
+
+    def execute_detector_auto_stigmator(self, detector_id: str) -> None:
+        """Atomic: Execute Auto Stigmator (STEM)."""
+        d = self._get_detector(detector_id)
+        self._write_hw(d, "AutoStigmator", "DET")
+
+    def execute_detector_auto_z(self, detector_id: str) -> None:
+        """Atomic: Execute Auto Z (STEM)."""
+        d = self._get_detector(detector_id)
+        self._write_hw(d, "AutoZ", "DET")
+
+    def execute_detector_auto_orientation(self, detector_id: str) -> None:
+        """Atomic: Execute Auto Orientation (STEM)."""
+        d = self._get_detector(detector_id)
+        self._write_hw(d, "AutoOrientation", "DET")
+
+    def execute_snapshot_all(self) -> None:
+        """Atomic: Trigger simultaneous acquisition on all detectors (STEM)."""
+        fn_mod = self._get_detector_function_module()
+        if not fn_mod:
+            raise RuntimeError("Detector module function interface missing.")
+        self._write_hw(fn_mod, "snapshotall", "DET")
+
+    def set_detector_accumulation(self, active: bool) -> None:
+        """Atomic: Enable/Disable Live Image Accumulation/Averaging."""
+        fn_mod = self._get_detector_function_module()
+        if not fn_mod:
+            raise RuntimeError("Detector module function interface missing.")
+
+        method = "start_accumulate_image_cache" if active else "stop_accumulate_image_cache"
+        self._write_hw(fn_mod, method, "DET")
 
     # --- Helper Layer Overrides ---
 
     def get_detector_settings(self, detector_id: str) -> DetectorSettings:
         """
-        Override: Get full detector state including vendor extras (Gain, Offset, etc).
-        Fetches the complete settings payload from hardware via `get_detectorsetting`
-        and uses the adapter to populate standard fields and extras.
+        Override: Get full detector state including vendor extras.
+        Converts the raw adapter dictionary into JeolDetectorExtras.
         """
         if self.det_mod is None:
             logger.debug("[DET] GetSettings failed: Hardware not connected.")
@@ -2280,13 +2764,20 @@ class JeolMicroscope(TemMicroscope):
 
         try:
             d = self._get_detector(detector_id)
-            # Fetch raw dict from PyJEM (contains GainIndex, ScanMode, etc.)
             raw = d.get_detectorsetting()
 
-            # Use adapter to parse standard fields AND pack unknown keys into extra.vendor['JEOL']
-            # Note: Expects adapter to return (DetectorSettings, DetectorCapabilities)
+            # The adapter puts raw keys into a dict at settings.extra.vendor["JEOL"]
             settings, _ = jeol_adapter.from_jeol_detector_response(raw, detector_id)
+
+            # UPGRADE: Convert the dict into our strongly-typed object
+            if settings.extra and "JEOL" in settings.extra.vendor:
+                raw_jeol = settings.extra.vendor["JEOL"]
+                if isinstance(raw_jeol, dict):
+                    typed_extras = JeolDetectorExtras.from_dict(raw_jeol, mode=ParseMode.LENIENT)
+                    settings.extra.vendor["JEOL"] = typed_extras
+
             return settings
+
         except Exception as e:
             logger.debug(f"[DET] GetSettings({detector_id}) failed: {e}")
             return DetectorSettings(detector_id=detector_id)
@@ -2294,9 +2785,6 @@ class JeolMicroscope(TemMicroscope):
     def apply_detector_settings(self, detector_id: str, settings: DetectorSettings, **kwargs) -> None:
         """
         Override: Apply settings using bulk setter to handle extras (Gain, Offset).
-        Standard atomic setters (e.g. set_detector_exposure) do not cover all vendor
-        capabilities. This method constructs a full configuration dictionary
-        (merging standard fields + extra.vendor['JEOL']) and sends it via `set_detectorsetting`.
         """
         if self.det_mod is None:
             logger.error("[DET] ApplySettings failed: Hardware not connected.")
@@ -2305,8 +2793,18 @@ class JeolMicroscope(TemMicroscope):
         try:
             d = self._get_detector(detector_id)
 
-            # Use adapter to convert standard fields + vendor extras back into a single JEOL dict
-            payload = jeol_adapter.to_jeol_detector_config(settings)
+            # Defensive Check: The adapter's `to_jeol_detector_config` likely expects
+            # a dictionary for vendor extras, not our new dataclass. We serialize
+            # it back to a dictionary specifically for the adapter to read.
+            settings_for_adapter = settings
+            vend = getattr(settings.extra, "vendor", {})
+            if isinstance(vend.get("JEOL"), JeolDetectorExtras):
+                import copy
+                settings_for_adapter = copy.deepcopy(settings)
+                settings_for_adapter.extra.vendor["JEOL"] = vend["JEOL"].to_dict()
+
+            # Use adapter to convert standard fields + vendor dict into JEOL payload
+            payload = jeol_adapter.to_jeol_detector_config(settings_for_adapter)
 
             if not payload:
                 logger.debug(f"[DET] ApplySettings({detector_id}): No changes in payload.")
@@ -2319,6 +2817,61 @@ class JeolMicroscope(TemMicroscope):
             logger.error(f"[DET] ApplySettings({detector_id}) failed: {e}")
             raise
 
+    def perform_detector_action(self, action: str, **kwargs) -> None:
+        """
+        Override: Handles standard actions + STEM Automation.
+        """
+        act = action.upper().strip()
+        d_id = kwargs.get("detector_id", self.get_primary_detector_id())
+
+        # 1. Validation Logic (The "Brain")
+        is_stem = self._is_stem_detector(d_id)
+
+        if act == "AUTO_CONTRAST":
+            if not is_stem:
+                raise ValueError("Auto Contrast is only for STEM detectors. Use Auto Exposure for Cameras.")
+            logger.info(f"[DET] Action: Auto Contrast/Brightness on {d_id}")
+            # 2. Call Atomic Method (The "Hands")
+            self.execute_detector_auto_contrast(d_id)
+
+        elif act == "AUTO_FOCUS":
+            if not is_stem:
+                raise ValueError("Hardware Auto Focus is only for STEM mode.")
+            logger.info(f"[DET] Action: Auto Focus on {d_id}")
+            self.execute_detector_auto_focus(d_id)
+
+        elif act == "AUTO_STIGMATOR":
+            if not is_stem:
+                raise ValueError("Hardware Auto Stigmator is only for STEM mode.")
+            logger.info(f"[DET] Action: Auto Stigmator on {d_id}")
+            self.execute_detector_auto_stigmator(d_id)
+
+        elif act == "AUTO_Z":
+            if not is_stem:
+                raise ValueError("Hardware Auto Z is only for STEM mode.")
+            logger.info(f"[DET] Action: Auto Z on {d_id}")
+            self.execute_detector_auto_z(d_id)
+
+        elif act == "AUTO_ORIENTATION":
+            if not is_stem:
+                raise ValueError("Hardware Auto Orientation is only for STEM mode.")
+            logger.info(f"[DET] Action: Auto Orientation on {d_id}")
+            self.execute_detector_auto_orientation(d_id)
+
+        elif act == "SNAPSHOT_ALL":
+            if self.get_mode() != "STEM":
+                raise RuntimeError("SnapshotAll is only available in STEM mode.")
+            logger.info("[DET] Action: Snapshot All Detectors")
+            self.execute_snapshot_all()
+
+        elif act == "SET_ACCUMULATION":
+            active = bool(kwargs.get("active", True))
+            logger.info(f"[DET] Action: Set Accumulation/Averaging = {active}")
+            self.set_detector_accumulation(active)
+
+        else:
+            super().perform_detector_action(action, **kwargs)
+
     # =========================================================================
     # 7. Scan Control (STEM)
     # =========================================================================
@@ -2326,156 +2879,135 @@ class JeolMicroscope(TemMicroscope):
     # --- Atomic Getters ---
 
     def get_scan_mode(self) -> str:
-        """Get scan mode (e.g. 'Spot', 'Area'). Querying detector first."""
+        """Get scan mode ('Scan', 'Spot', 'Area')."""
         d = self._get_scan_controller_detector()
-        if d is not None and hasattr(d, "get_detectorsetting"):
-            try:
-                st = d.get_detectorsetting()
+        if d:
+            def _extract_mode(st):
                 if isinstance(st, dict):
-                    raw = self._first_int(st, ("ScanMode", "ScanModeValue", "ScanModeIndex"))
+                    raw = st.get("ScanMode") or st.get("ScanModeValue")
                     if raw is not None:
-                        return {0: "Scan", 1: "Spot", 3: "Area"}.get(raw, str(raw))
-                    raw_s = st.get("ScanModeStr") or st.get("ScanModeString")
-                    if isinstance(raw_s, str) and raw_s.strip():
-                        return raw_s.strip()
-            except Exception:
-                pass
+                        # 0=Scan, 1=Spot, 3=Area
+                        return {0: "Scan", 1: "Spot", 2: "Scan", 3: "Area"}.get(raw, str(raw))
+                return "UNKNOWN"
+
+            val = self._read_hw(d, "get_detectorsetting", "SCAN", converter=_extract_mode)
+            if val: return val
+
         return str(self._scan_cfg.get("mode", "Scan"))
 
     def get_scan_active(self) -> bool:
         """Check if external scan control is active."""
+        # Check Scan Coils (Hardware Source of Truth)
         if self.scan and hasattr(self.scan, "GetExtScanMode"):
-            try:
-                return bool(int(self.scan.GetExtScanMode()) == 1)
-            except Exception:
-                pass
+            val = self._read_hw(self.scan, "GetExtScanMode", "SCAN", converter=lambda x: int(x) == 1)
+            if val is not None:
+                return val
+
+        # Fallback to internal state
         return bool(self._scan_cfg.get("active", False))
 
     def get_scan_width(self) -> Optional[int]:
-        """Get active scan width in pixels."""
         d = self._get_scan_controller_detector()
-        if d is not None and hasattr(d, "get_detectorsetting"):
-            try:
-                st = d.get_detectorsetting()
-                if isinstance(st, dict):
-                    w = self._first_int(st, ("Width", "ImagingAreaWidth"))
-                    if w is not None:
-                        self._scan_cfg["width_px"] = w
-                        return w
-            except Exception:
-                pass
-        return None
+
+        def _extract_w(st):
+            val = self._first_int(st, ("Width", "ImagingAreaWidth"))
+            if val is not None:
+                self._scan_cfg["width_px"] = val  # Update cache inside converter
+                return val
+            return None
+
+        return self._read_hw(d, "get_detectorsetting", "SCAN", converter=_extract_w)
 
     def get_scan_height(self) -> Optional[int]:
-        """Get active scan height in pixels."""
         d = self._get_scan_controller_detector()
-        if d is not None and hasattr(d, "get_detectorsetting"):
-            try:
-                st = d.get_detectorsetting()
-                if isinstance(st, dict):
-                    h = self._first_int(st, ("Height", "ImagingAreaHeight"))
-                    if h is not None:
-                        self._scan_cfg["height_px"] = h
-                        return h
-            except Exception:
-                pass
-        return None
+
+        def _extract_h(st):
+            val = self._first_int(st, ("Height", "ImagingAreaHeight"))
+            if val is not None:
+                self._scan_cfg["height_px"] = val
+                return val
+            return None
+
+        return self._read_hw(d, "get_detectorsetting", "SCAN", converter=_extract_h)
 
     def get_scan_pixel_dwell(self) -> Optional[Quantity]:
-        """Get pixel dwell time (cached from config, as HW read is unreliable)."""
-        return None
+        """Get pixel dwell time (µs) from active STEM detector."""
+        d_obj = self._get_scan_controller_detector()
+
+        def _extract_dwell(st):
+            # Known to be STEM here, so raw ExposureTimeValue is µs
+            if isinstance(st, dict):
+                raw = st.get("ExposureTimeValue") or st.get("Exposure") or st.get("ExposureTime")
+                if raw is not None:
+                    return Q_(float(raw), Units.US)
+            return None
+
+        return self._read_hw(d_obj, "get_detectorsetting", "SCAN", converter=_extract_dwell)
 
     def get_scan_flyback(self) -> Optional[Quantity]:
         """Get flyback time (cached from config)."""
         return None
 
     def get_scan_rotation(self) -> Optional[Quantity]:
-        """Get scan rotation."""
-        if self.scan and hasattr(self.scan, "GetRotationAngleEx"):
-            try:
-                return Q_(float(self.scan.GetRotationAngleEx()), Units.DEG)
-            except Exception:
-                pass
+        """Get scan rotation (Tries Scan coils first, then Detector)."""
+        # 1. Try Scan Coils (Primary for rotation)
+        if self.scan:
+            # Try Ex first (ARM200F+)
+            if hasattr(self.scan, "GetRotationAngleEx"):
+                val = self._read_hw(self.scan, "GetRotationAngleEx", "SCAN",
+                                    converter=lambda x: Q_(float(x), Units.DEG))
+                if val is not None: return val
 
-        if self.scan and hasattr(self.scan, "GetRotationAngle"):
-            try:
-                return Q_(float(self.scan.GetRotationAngle()), Units.DEG)
-            except Exception:
-                pass
+            # Try Standard
+            if hasattr(self.scan, "GetRotationAngle"):
+                val = self._read_hw(self.scan, "GetRotationAngle", "SCAN",
+                                    converter=lambda x: Q_(float(x), Units.DEG))
+                if val is not None: return val
 
-        # Fallback to detector settings
+        # 2. Fallback to Active Detector Settings
         d = self._get_scan_controller_detector()
-        if d is not None and hasattr(d, "get_detectorsetting"):
-            try:
-                st = d.get_detectorsetting()
-                if isinstance(st, dict):
-                    ang = self._first_float(st, ("ScanRotation", "ScanRotationValue"))
-                    if ang is not None:
-                        return Q_(ang, Units.DEG)
-            except Exception:
-                pass
-        return None
+
+        def _extract_rot(st):
+            ang = self._first_float(st, ("ScanRotation", "ScanRotationValue"))
+            return Q_(ang, Units.DEG) if ang is not None else None
+
+        return self._read_hw(d, "get_detectorsetting", "SCAN", converter=_extract_rot)
 
     # --- Atomic Setters ---
 
     def set_scan_mode(self, mode: str, **kwargs) -> None:
-        """Set scan mode (e.g. 'Spot', 'Area')."""
         m = (mode or "").strip().lower()
-        mapping = {"scan": 0, "full": 0, "full frame": 0, "spot": 1, "area": 3}
-        if m not in mapping and m.isdigit():
-            mapping[m] = int(m)
-        val = mapping.get(m)
-        if val is None:
+        mapping = {"scan": 0, "full": 0, "spot": 1, "area": 3}
+
+        if m not in mapping:
             raise ValueError(f"Unsupported scan mode: {mode}")
 
-        logger.debug(f"[SCAN] Setting Mode: {val}")
-
+        val = mapping[m]
         d = self._get_scan_controller_detector()
-        if d is None:
-            logger.error("[SCAN] SetMode failed: No scan controller detector found.")
+
+        if d:
+            # Most STEM detectors support set_scanmode
+            if hasattr(d, "set_scanmode"):
+                self._write_hw(d, "set_scanmode", "SCAN", int(val))
+                self._scan_cfg["mode"] = {0: "Scan", 1: "Spot", 3: "Area"}.get(int(val), str(val))
+            else:
+                # Fallback to dict update
+                self._write_hw(d, "set_detectorsetting", "SCAN", {"ScanMode": int(val)})
+        else:
             raise RuntimeError("Scan detector hardware not connected.")
 
-        if hasattr(d, "set_scanmode"):
-            try:
-                d.set_scanmode(int(val))
-                self._scan_cfg["mode"] = {0: "Scan", 1: "Spot", 3: "Area"}.get(int(val), str(val))
-                return
-            except Exception as e:
-                logger.error(f"[SCAN] SetMode failed: {e}")
-                raise
-
-        self._scan_cfg["mode"] = {0: "Scan", 1: "Spot", 3: "Area"}.get(int(val), str(val))
-
     def set_scan_active(self, active: bool, **kwargs) -> None:
-        """Start or stop the scan engine."""
-        detector_handled = False
         d = self._get_scan_controller_detector()
-        logger.debug(f"[SCAN] SetActive({active})")
+        if d is None:
+            raise RuntimeError("Scan detector hardware not connected.")
 
-        # Detector-specific logic (Preferred)
-        if d is not None:
-            try:
-                if active and hasattr(d, "livestart"):
-                    d.livestart()
-                    detector_handled = True
-                elif (not active) and hasattr(d, "livestop"):
-                    d.livestop()
-                    detector_handled = True
-            except Exception as e:
-                logger.warning(f"[SCAN] Detector Live Control failed, attempting fallback: {e}")
-
-        # Fallback to internal scan generator
-        if not detector_handled:
-            if self.scan and hasattr(self.scan, "SetExtScanMode"):
-                try:
-                    self.scan.SetExtScanMode(1 if active else 0)
-                except Exception as e:
-                    logger.error(f"[SCAN] SetExtScanMode failed: {e}")
-                    raise
-            else:
-                # If detector failed and no fallback exists
-                logger.error("[SCAN] SetActive failed: Detector failed and no internal scan control.")
-                raise RuntimeError("Scan control failed.")
+        logger.debug(f"[SCAN] SetActive: {active}")
+        if active:
+            if hasattr(d, "livestart"):
+                self._write_hw(d, "livestart", "SCAN")
+        else:
+            if hasattr(d, "livestop"):
+                self._write_hw(d, "livestop", "SCAN")
 
     def set_scan_width(self, width: int, **kwargs) -> None:
         self._set_imaging_area(width=int(width))
@@ -2484,8 +3016,18 @@ class JeolMicroscope(TemMicroscope):
         self._set_imaging_area(height=int(height))
 
     def set_scan_pixel_dwell(self, time: Quantity, **kwargs) -> None:
-        logger.error("[SCAN] set_scan_pixel_dwell not supported by JEOL driver IO.")
-        raise NotImplementedError("Hardware dwell time control not supported.")
+        """Set pixel dwell time (µs)."""
+        d_obj = self._get_scan_controller_detector()
+        if not d_obj:
+            logger.error("[SCAN] SetDwell failed: No active STEM detector found.")
+            raise RuntimeError("No STEM detector available.")
+
+        val_us = float(time.to(Units.US).magnitude)
+
+        if hasattr(d_obj, "set_exposuretime_value"):
+            self._write_hw(d_obj, "set_exposuretime_value", "SCAN", val_us)
+        else:
+            self._write_hw(d_obj, "set_detectorsetting", "SCAN", {"ExposureTimeValue": val_us})
 
     def set_scan_flyback(self, time: Quantity, **kwargs) -> None:
         logger.error("[SCAN] set_scan_flyback not supported by JEOL driver IO.")
@@ -2493,37 +3035,29 @@ class JeolMicroscope(TemMicroscope):
 
     def set_scan_rotation(self, angle: Quantity, **kwargs) -> None:
         deg = float(angle.to(Units.DEG).magnitude)
-        logger.debug(f"[SCAN] SetRotation({deg})")
-
         d = self._get_scan_controller_detector()
-        detector_success = False
 
-        # Try Detector First
+        # 1. Try Detector (Preferred for STEM)
         if d is not None and hasattr(d, "set_scanrotation"):
             try:
-                d.set_scanrotation(float(deg))
-                detector_success = True
+                # We use _write_hw here so we get the standard "[SCAN] set_scanrotation..." log
+                self._write_hw(d, "set_scanrotation", "SCAN", float(deg))
                 return
-            except Exception as e:
-                logger.warning(f"[SCAN] Detector SetRotation failed, attempting fallback: {e}")
+            except Exception:
+                logger.debug(f"[SCAN] Detector rotation failed, falling back to Coils.")
 
-        # Try Scan Coils Fallback
+        # 2. Try Scan Coils (Fallback)
         if self.scan:
-            try:
-                if hasattr(self.scan, "SetRotationAngleEx"):
-                    self.scan.SetRotationAngleEx(float(deg))
-                    return
-                if hasattr(self.scan, "SetRotationAngle"):
-                    self.scan.SetRotationAngle(int(round(deg)) % 360)
-                    return
-            except Exception as e:
-                logger.error(f"[SCAN] Hardware SetRotation failed: {e}")
-                raise
+            if hasattr(self.scan, "SetRotationAngleEx"):
+                self._write_hw(self.scan, "SetRotationAngleEx", "SCAN", float(deg))
+                return
+            elif hasattr(self.scan, "SetRotationAngle"):
+                self._write_hw(self.scan, "SetRotationAngle", "SCAN", int(round(deg)) % 360)
+                return
 
-        # If we reached here, neither worked
-        if not detector_success:
-            logger.error("[SCAN] SetRotation failed: No capable hardware found.")
-            raise RuntimeError("SetRotation failed on both detector and scan coils.")
+        # 3. Failure
+        logger.error("[SCAN] SetRotation failed: No capable hardware found.")
+        raise RuntimeError("SetRotation failed on both detector and scan coils.")
 
     # =========================================================================
     # 8. Vacuum Control
@@ -2532,25 +3066,32 @@ class JeolMicroscope(TemMicroscope):
     # --- Atomic Getters ---
 
     def get_column_valve_state(self) -> str:
-        # Logic retention: Bitfield 0 check
+        """Check Column Valve (V2) status via GetValveStatus."""
+        # [cite: 2294] GetValveStatus returns [count, v1, v2]
         res = self._read_hw(self.vac, "GetValveStatus", "VAC")
         if res and isinstance(res, (list, tuple)) and len(res) > 1:
-            return "OPEN" if (res[1] & 1) else "CLOSED"
+            # Bitmask logic is standard JEOL, though specific bits vary.
+            # Usually Bit 0 of V2 indicates Open.
+            return "OPEN" if (res[2] & 1) else "CLOSED"
         return "UNKNOWN"
 
     def get_gun_valve_state(self) -> str:
         """Atomic: Robust check for V1 (FEG or Thermionic)."""
-        # 1. Try FEG3 (Modern/FEG)
+        # 1. Try FEG3 [cite: 1032]
         if hasattr(self.feg, "GetBeamValve"):
-            val = self._read_hw(self.feg, "GetBeamValve", "VAC")
+            gun_type = self.get_gun_type_index()
+            # FEG/CFEG/TFEG Types: 3, 11-16, 19-22 [cite: 1259]
+            if gun_type in (3, 11, 12, 13, 14, 15, 16, 19, 20, 21, 22):
+                val = self._read_hw(self.feg, "GetBeamValve", "VAC")
+                if val == 1: return "OPEN"
+                if val == 0: return "CLOSED"
+                return "UNKNOWN"
+
+        # 2. Fallback to GUN3 [cite: 1211]
+        if hasattr(self.gun, "GetBeamSw"):
+            val = self._read_hw(self.gun, "GetBeamSw", "VAC")
             if val == 1: return "OPEN"
             if val == 0: return "CLOSED"
-
-        # 2. Fallback to GUN3 (Thermionic)
-        # Cite: PyJEM_TEM3_reorganized_clean.docx (GUN3.GetBeamValve)
-        val = self._read_hw(self.gun, "GetBeamValve", "VAC")
-        if val == 1: return "OPEN"
-        if val == 0: return "CLOSED"
 
         return "UNKNOWN"
 
@@ -2561,21 +3102,90 @@ class JeolMicroscope(TemMicroscope):
         return "UNKNOWN"
 
     def get_column_pressure(self) -> Optional[Quantity]:
-        # Logic retention: GetPegInfo()[0]
-        res = self._read_hw(self.vac, "GetPegInfo", "VAC")
-        if res and len(res) > 0:
-            return Q_(float(res[0]), Units.PA)
-        return None
+        # FIX: Added Units.PASCAL
+        return self._get_gauge_value("PEG", "COLUMN_PEG", Units.PA)
 
     def get_gun_pressure(self) -> Optional[Quantity]:
         # Usually not exposed in basic PyJEM
         return None
 
     def get_buffer_tank_pressure(self) -> Optional[Quantity]:
-        res = self._read_hw(self.vac, "GetPigInfo", "VAC")
-        if res and len(res) > 0:
-            return Q_(float(res[0]), Units.PA)
-        return None
+        # FIX: Added Units.MICRO_AMPERE
+        return self._get_gauge_value("PIG", "BUFFER_PIG", Units.UA)
+
+    # --- Atomic Getters (Vendor Specific) ---
+
+    def get_column_ready_state(self) -> str:
+        """
+        Check if Column is ready (VACUUM3.GetColumnReady).
+        """
+        # [cite: 2240] GetColumnReady returns 1=Ready, 0=Not Ready
+        val = self._read_hw(self.vac, "GetColumnReady", "VAC", self._to_int)
+        if val == 1: return "READY"
+        if val == 0: return "NOT_READY"
+        return "UNKNOWN"
+
+    def get_camera_ready_state(self) -> str:
+        """
+        Check if Camera chamber is ready (VACUUM3.GetCameraReady).
+        """
+        # [cite: 2222] GetCameraReady returns 1=Ready, 0=Not Ready
+        val = self._read_hw(self.vac, "GetCameraReady", "VAC", self._to_int)
+        if val == 1: return "READY"
+        if val == 0: return "NOT_READY"
+        return "UNKNOWN"
+
+    def get_specimen_ready_state(self) -> str:
+        """Check if specimen is ready for insertion (VACUUM3.GetSpecimenReady)."""
+        # [cite: 2285] GetSpecimenReady: 0=Not Ready, 1=Ready
+        val = self._read_hw(self.vac, "GetSpecimenReady", "VAC", self._to_int)
+        if val == 1: return "READY"
+        if val == 0: return "NOT_READY"
+        return "UNKNOWN"
+
+    def get_column_air_state(self) -> str:
+        """Check if specimen chamber is vented (VACUUM3.GetSpecimenAir)."""
+        # [cite: 2267] GetSpecimenAir: 0=Not Air, 1=Air
+        val = self._read_hw(self.vac, "GetColumnAir", "VAC", self._to_int)
+        if val == 1: return "AIR"
+        if val == 0: return "VACUUM"
+        return "UNKNOWN"
+
+    def get_camera_air_state(self) -> str:
+        """Check if specimen chamber is vented (VACUUM3.GetSpecimenAir)."""
+        # [cite: 2267] GetSpecimenAir: 0=Not Air, 1=Air
+        val = self._read_hw(self.vac, "GetCameraAir", "VAC", self._to_int)
+        if val == 1: return "AIR"
+        if val == 0: return "VACUUM"
+        return "UNKNOWN"
+
+    def get_specimen_air_state(self) -> str:
+        """Check if specimen chamber is vented (VACUUM3.GetSpecimenAir)."""
+        # [cite: 2267] GetSpecimenAir: 0=Not Air, 1=Air
+        val = self._read_hw(self.vac, "GetSpecimenAir", "VAC", self._to_int)
+        if val == 1: return "AIR"
+        if val == 0: return "VACUUM"
+        return "UNKNOWN"
+
+    def get_specimen_pre_evac_state(self) -> str:
+        """Check if specimen pumping has started (VACUUM3.GetSpecimenPreEvacStart)."""
+        # [cite: 2276] GetSpecimenPreEvacStart: 0=Not start, 1=Start
+        val = self._read_hw(self.vac, "GetSpecimenPreEvacStart", "VAC", self._to_int)
+        if val == 1: return "PUMPING"
+        if val == 0: return "IDLE"
+        return "UNKNOWN"
+
+    def get_column_rough_pressure(self) -> Optional[Quantity]:
+        # FIX: Added Units.MICRO_AMPERE
+        return self._get_gauge_value("PIG", "COLUMN_PIG", Units.UA)
+
+    def get_specimen_chamber_pressure(self) -> Optional[Quantity]:
+        # FIX: Added Units.MICRO_AMPERE
+        return self._get_gauge_value("PIG", "SPECIMEN_PIG", Units.UA)
+
+    def get_detector_chamber_pressure(self) -> Optional[Quantity]:
+        # FIX: Added Units.MICRO_AMPERE
+        return self._get_gauge_value("PIG", "DETECTOR_PIG", Units.UA)
 
     # --- Atomic Setters ---
 
@@ -2583,15 +3193,21 @@ class JeolMicroscope(TemMicroscope):
         raise NotImplementedError("Column Valve control not supported.")
 
     def set_gun_valve_state(self, state: str, **kwargs) -> None:
-        """Atomic: Set V1 State (Open/Close). Handles FEG vs Thermionic."""
         is_open = 1 if state.upper() == "OPEN" else 0
 
-        # Prefer FEG3 if available
+        # FEG3 priority [cite: 1060]
         if hasattr(self.feg, "SetBeamValve"):
-            self._write_hw(self.feg, "SetBeamValve", "VAC", is_open)
+            gun_type = self.get_gun_type_index()
+            # FEG/CFEG/TFEG Types: 3, 11-16, 19-22 [cite: 1259]
+            if gun_type in (3, 11, 12, 13, 14, 15, 16, 19, 20, 21, 22):
+                self._write_hw(self.feg, "SetBeamValve", "VAC", is_open)
+                return
+
+        # GUN3 fallback [cite: 1321]
+        if hasattr(self.gun, "SetBeamSw"):
+            self._write_hw(self.gun, "SetBeamSw", "VAC", is_open)
         else:
-            # Cite: PyJEM_TEM3_reorganized_clean.docx (GUN3.SetBeamValve)
-            self._write_hw(self.gun, "SetBeamValve", "VAC", is_open)
+            logger.warning("[VAC] No gun valve control found.")
 
     def set_turbo_pump_state(self, state: str, **kwargs) -> None:
         raise NotImplementedError("Turbo Pump control not supported.")
@@ -2603,7 +3219,23 @@ class JeolMicroscope(TemMicroscope):
     # --- Atomic Getters ---
 
     def list_apertures(self) -> List[str]:
-        return list(self._APERTURE_MAP.keys())
+        """
+        Return list of available apertures based on the configuration settings.
+        """
+        # 1. Get the list of installed apertures from the config object
+        #    (This assumes your settings JSON/YAML defined 'aperture_system.available_aperture_ids')
+        configured_ids = []
+        if self.system_settings.aperture_system and self.system_settings.aperture_system.available_aperture_ids:
+            configured_ids = self.system_settings.aperture_system.available_aperture_ids
+
+        # 2. If config exists, return the intersection (Valid & Configured)
+        if configured_ids:
+            return [aid for aid in configured_ids if aid in self._APERTURE_MAP]
+
+        # 3. Fallback: If config is empty, return defaults (Safety net)
+        #    We exclude AUX/Unknowns to prevent errors on unconfigured systems.
+        defaults = ["CLA", "OLA", "HCA", "SAA", "ENTA"]
+        return [k for k in defaults if k in self._APERTURE_MAP]
 
     def get_aperture_inserted(self, aperture_id: str) -> bool:
         # Inferred from size index > 0
@@ -2615,8 +3247,7 @@ class JeolMicroscope(TemMicroscope):
         if kind is None: return None
 
         # Use helper for the state change and the read
-        self._write_hw(self.apt, "SelectExpKind", "APT", kind)
-        return self._read_hw(self.apt, "GetExpSize", "APT", self._to_int, args=(kind,))
+        return self._read_hw(self.apt, "GetExpSize", "APT", self._to_int, None, kind)
 
     def get_aperture_size_label(self, aperture_id: str) -> Optional[str]:
         return None

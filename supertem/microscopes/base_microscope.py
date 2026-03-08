@@ -1,5 +1,5 @@
 """
-supertem.microscope
+supertem.microscopes.base_microscope
 
 The Hardware Abstraction Layer (HAL) and Control Plane Orchestrator.
 
@@ -67,7 +67,7 @@ Safety is handled via a "Dual-Gatekeeper" model:
 III. Data Integrity & Parse Modes
 ===============================================================================
 
-Drivers must implement the "Ingress/Egress" policy using `base.py` ParseModes:
+Drivers must implement the "Ingress/Egress" policy using `base_structures.py` ParseModes:
 
   A. Egress (Control Plane / Writing to Hardware) -> ParseMode.STRICT
      - Context: `apply_...` methods and `move_stage...`.
@@ -150,6 +150,19 @@ logging rules:
           ```
 
 ===============================================================================
+VI. Payload Mutation Hooks
+===============================================================================
+
+To support strong typing for proprietary vendor parameters without breaking the
+universality of this base class, we use a Payload Mutation Pattern.
+
+Before executing a request, the Orchestrator calls a `_validate_vendor_...` hook.
+Vendor implementations (like JeolMicroscope) override these hooks to inspect
+`target.extra.vendor["VENDOR_NAME"]`, instantiate their specific strictly-typed
+dataclass (e.g., `JeolBeamExtras`), validate it, and replace the dictionary with
+the object IN PLACE.
+
+===============================================================================
 Usage
 ===============================================================================
 
@@ -158,7 +171,8 @@ Usage
 
   # 2. Control (Use Orchestrators)
   req = StageMoveRequest(target=StagePosition(x=Q_(10, 'um')))
-  scope.execute_stage_move(req)  # -> Checks limits -> Calls move_stage_absolute
+  scope.execute_stage_move(req)  # -> Checks limits -> Delegates to safe_move_stage
+  -> Breaks into linear interpolations -> Calls apply_stage_position
 
 """
 
@@ -170,8 +184,8 @@ import datetime
 import os
 from pathlib import Path
 
-# Import strictly typed structures from base.py
-from supertem.structures.base import (
+# Import strictly typed structures from base_structures.py
+from supertem.structures.base_structures import (
     # Configuration & Safety
     MicroscopeSettings,
     SystemSettings,
@@ -260,14 +274,14 @@ class TemMicroscope(ABC):
         if isinstance(vend, dict):
             for vname, payload in vend.items():
                 if isinstance(payload, dict):
-                    keys = [k for k, v in payload.items() if v is not None]
+                    keys = [f"{k}={v}" for k, v in payload.items() if v is not None]
                     if keys:
                         parts.append(f"vendor.{vname}({', '.join(keys)})")
                 elif payload is not None:
                     parts.append(f"vendor.{vname}")
         unk = getattr(extra, "unknown", None)
         if isinstance(unk, dict):
-            keys = [k for k, v in unk.items() if v is not None]
+            keys = [f"{k}={v}" for k, v in unk.items() if v is not None]
             if keys:
                 parts.append(f"unknown({', '.join(keys)})")
         return "; ".join(parts)
@@ -282,7 +296,7 @@ class TemMicroscope(ABC):
             if name.startswith("_") or name == "extra":
                 continue
             if val is not None:
-                fields.append(name)
+                fields.append(f"{name}={val}")
         extra_s = cls._summarize_extras(getattr(target, "extra", None))
         if extra_s:
             fields.append(extra_s)
@@ -300,6 +314,32 @@ class TemMicroscope(ABC):
         y = getattr(p, "y", None)
         if (x is None) ^ (y is None):
             raise ValueError(f"{name} requires both x and y when provided (got x={x}, y={y}).")
+
+    # =========================================================================
+    # VENDOR PAYLOAD MUTATION HOOKS
+    # =========================================================================
+    # Vendor subclasses override these to swap raw dicts with typed Extra Dataclasses.
+
+    def _validate_vendor_stage(self, target: StagePosition) -> None:
+        pass
+
+    def _validate_vendor_beam(self, target: BeamSettings) -> None:
+        pass
+
+    def _validate_vendor_projection(self, target: ProjectionSettings) -> None:
+        pass
+
+    def _validate_vendor_detector(self, target: DetectorSettings) -> None:
+        pass
+
+    def _validate_vendor_scan(self, target: ScanSettings) -> None:
+        pass
+
+    def _validate_vendor_vacuum(self, target: VacuumSettings) -> None:
+        pass
+
+    def _validate_vendor_aperture(self, target: ApertureSettings) -> None:
+        pass
 
     # =========================================================================
     # 1. Connection & Lifecycle
@@ -366,7 +406,7 @@ class TemMicroscope(ABC):
         Capture a comprehensive snapshot of the entire microscope state.
 
         Aggregates data from all subsystems (Stage, Beam, Optics, etc.) into
-        a single timestamped structure matching base.py definition.
+        a single timestamped structure matching base_structures.py definition.
         """
         return MicroscopeState(
             timestamp=datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -507,6 +547,9 @@ class TemMicroscope(ABC):
             if current is None:
                 raise RuntimeError("Relative move failed: Current stage position is unknown.")
             target_abs = current + request.target
+
+        # PAYLOAD MUTATION HOOK
+        self._validate_vendor_stage(target_abs)
 
         # 2. Safety Check
         sys = self.system_settings.stage_system
@@ -808,6 +851,9 @@ class TemMicroscope(ABC):
         intent_str = " ".join(intent) if intent else "No Operation"
         logger.info(f"[BEAM] Control: {intent_str}")
 
+        # PAYLOAD MUTATION HOOK
+        self._validate_vendor_beam(request.target)
+
         # Safety Check
         sys = self.system_settings.beam_system
         if sys and request.target:
@@ -1001,6 +1047,9 @@ class TemMicroscope(ABC):
 
         intent_str = " ".join(intent) if intent else "No Operation"
         logger.info(f"[PROJ] Control: {intent_str}")
+
+        # PAYLOAD MUTATION HOOK
+        self._validate_vendor_projection(request.target)
 
         sys = self.system_settings.projection_system
         if sys and request.target:
@@ -1337,6 +1386,9 @@ class TemMicroscope(ABC):
         intent_str = " ".join(intent) if intent else "No Operation"
         logger.info(f"[DET] Executing Control on {request.detector_id}: {intent_str}")
 
+        # PAYLOAD MUTATION HOOK
+        self._validate_vendor_detector(request.target)
+
         sys = self.system_settings.detector_system
         if sys and request.target:
             if not sys.is_supported(request.target):
@@ -1542,6 +1594,9 @@ class TemMicroscope(ABC):
 
         exec_opts = request.extra.options if request.extra else {}
 
+        # PAYLOAD MUTATION HOOK
+        self._validate_vendor_scan(request.target)
+
         # 1. Settings
         if request.target:
             # (Safety checks...)
@@ -1658,6 +1713,8 @@ class TemMicroscope(ABC):
         logger.info(f"[VAC] Control: {' '.join(intent)}")
 
         exec_opts = request.extra.options if request.extra else {}
+        # PAYLOAD MUTATION HOOK
+        self._validate_vendor_vacuum(request.target)
 
         if request.force is not None:
             exec_opts['force'] = request.force
@@ -1776,6 +1833,9 @@ class TemMicroscope(ABC):
             intent.append("(Relative)")
 
         logger.info(f"[APT] Control on '{request.aperture_id}': {' '.join(intent)}")
+
+        # PAYLOAD MUTATION HOOK
+        self._validate_vendor_aperture(request.target)
 
         sys = self.system_settings.aperture_system
         if sys:
